@@ -30,10 +30,22 @@ pub struct HvfVcpu {
     vcpu: ffi::hv_vcpu_t,
     exit_info: *const ffi::hv_vcpu_exit_t,
     immediate_exit: Arc<AtomicBool>,
+    /// Shared copy of vcpu handle for cross-thread cancellation.
+    /// hv_vcpu_cancel is safe to call from any thread.
+    vcpu_for_cancel: Arc<VcpuCancelHandle>,
 }
 
-// SAFETY: HvfVcpu is bound to one thread (HVF requirement), but we need Send for the trait.
-// The caller must ensure single-threaded access per vCPU (which crosvm does).
+/// Thread-safe handle for cancelling a vCPU from another thread.
+struct VcpuCancelHandle(ffi::hv_vcpu_t);
+// SAFETY: hv_vcpu_cancel is explicitly documented as safe to call from any thread.
+unsafe impl Send for VcpuCancelHandle {}
+unsafe impl Sync for VcpuCancelHandle {}
+
+// SAFETY: HvfVcpu is created on one thread but moved to a dedicated vCPU thread by crosvm.
+// Send is needed for this transfer. Sync is required by the Vcpu trait (DowncastSync).
+// The raw pointer `exit_info` prevents auto-Sync, but it is only accessed from the vCPU
+// thread after `hv_vcpu_run` returns, and `hv_vcpu_cancel` (the only cross-thread operation)
+// does not access exit_info.
 unsafe impl Send for HvfVcpu {}
 unsafe impl Sync for HvfVcpu {}
 
@@ -62,6 +74,7 @@ impl HvfVcpu {
             vcpu,
             exit_info,
             immediate_exit: Arc::new(AtomicBool::new(false)),
+            vcpu_for_cancel: Arc::new(VcpuCancelHandle(vcpu)),
         })
     }
 
@@ -204,6 +217,11 @@ impl Vcpu for HvfVcpu {
 
     fn set_immediate_exit(&self, exit: bool) {
         self.immediate_exit.store(exit, Ordering::SeqCst);
+        if exit {
+            // Force the vCPU to exit hv_vcpu_run immediately.
+            // hv_vcpu_cancel is safe to call from any thread.
+            unsafe { ffi::hv_vcpu_cancel(self.vcpu_for_cancel.0) };
+        }
     }
 
     fn handle_mmio(&self, handle_fn: &mut dyn FnMut(IoParams) -> Result<()>) -> Result<()> {

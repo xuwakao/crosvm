@@ -45,9 +45,9 @@ pub struct HvfVm {
 impl HvfVm {
     /// Create a new HVF VM. The VM is already created by `Hvf::new()` (hv_vm_create).
     /// This just wraps the guest memory and tracking structures.
-    pub fn new(guest_mem: GuestMemory) -> Result<Self> {
+    pub fn new(hvf: Hvf, guest_mem: GuestMemory) -> Result<Self> {
         Ok(HvfVm {
-            hvf: Hvf,
+            hvf,
             guest_mem,
             mem_regions: Arc::new(Mutex::new(BTreeMap::new())),
             next_mem_slot: Arc::new(Mutex::new(0)),
@@ -59,7 +59,7 @@ impl HvfVm {
 impl Vm for HvfVm {
     fn try_clone(&self) -> Result<Self> {
         Ok(HvfVm {
-            hvf: Hvf,
+            hvf: self.hvf.try_clone()?,
             guest_mem: self.guest_mem.clone(),
             mem_regions: self.mem_regions.clone(),
             next_mem_slot: self.next_mem_slot.clone(),

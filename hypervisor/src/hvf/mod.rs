@@ -8,13 +8,33 @@ pub mod ffi;
 pub mod vcpu;
 pub mod vm;
 
+use std::sync::Arc;
+
 use base::Result;
 
 use crate::Hypervisor;
 use crate::HypervisorCap;
 
+/// Guard that calls hv_vm_destroy when the last reference is dropped.
+struct HvfVmGuard;
+
+impl Drop for HvfVmGuard {
+    fn drop(&mut self) {
+        // SAFETY: Called only once when the last Arc<HvfVmGuard> drops.
+        // All vCPUs must be destroyed before this point.
+        unsafe {
+            ffi::hv_vm_destroy();
+        }
+    }
+}
+
 /// Apple Hypervisor.framework instance.
-pub struct Hvf;
+///
+/// Uses Arc<HvfVmGuard> to ensure hv_vm_destroy is called exactly once,
+/// even when the Hvf instance is cloned (e.g. via try_clone or HvfVm::try_clone).
+pub struct Hvf {
+    _vm_guard: Arc<HvfVmGuard>,
+}
 
 impl Hvf {
     /// Create a new HVF hypervisor instance.
@@ -25,14 +45,17 @@ impl Hvf {
         // SAFETY: hv_vm_create with NULL config creates a default VM.
         let ret = unsafe { ffi::hv_vm_create(std::ptr::null_mut()) };
         ffi::hvf_result(ret)?;
-        Ok(Hvf)
+        Ok(Hvf {
+            _vm_guard: Arc::new(HvfVmGuard),
+        })
     }
 }
 
 impl Hypervisor for Hvf {
     fn try_clone(&self) -> Result<Self> {
-        // HVF is per-process singleton. Cloning is a no-op — just return another handle.
-        Ok(Hvf)
+        Ok(Hvf {
+            _vm_guard: self._vm_guard.clone(),
+        })
     }
 
     fn check_capability(&self, cap: HypervisorCap) -> bool {
@@ -40,15 +63,6 @@ impl Hypervisor for Hvf {
             HypervisorCap::UserMemory => true,
             HypervisorCap::ImmediateExit => true,
             _ => false,
-        }
-    }
-}
-
-impl Drop for Hvf {
-    fn drop(&mut self) {
-        // SAFETY: Destroying the VM. All vCPUs must be destroyed before this.
-        unsafe {
-            ffi::hv_vm_destroy();
         }
     }
 }

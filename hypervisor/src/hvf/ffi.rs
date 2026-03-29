@@ -300,6 +300,10 @@ extern "C" {
 
     // --- Debug ---
     pub fn hv_vcpu_set_trap_debug_exceptions(vcpu: hv_vcpu_t, enable: bool) -> hv_return_t;
+
+    // --- Cancellation ---
+    /// Force the vCPU to exit from hv_vcpu_run. Safe to call from any thread.
+    pub fn hv_vcpu_cancel(vcpu: hv_vcpu_t) -> hv_return_t;
 }
 
 // ============================================================================
