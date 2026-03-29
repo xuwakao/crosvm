@@ -60,6 +60,9 @@ impl Default for ExecutorKind {
         let default_fn = || ExecutorKindSys::Fd.into();
         #[cfg(windows)]
         let default_fn = || ExecutorKindSys::Handle.into();
+        
+        #[cfg(target_os = "macos")]
+        let default_fn = || ExecutorKindSys::Kqueue.into();
         *DEFAULT_EXECUTOR_KIND.get_or_init(default_fn)
     }
 }
@@ -162,6 +165,9 @@ pub enum TaskHandle<R> {
     Handle(common_executor::RawTaskHandle<windows::HandleReactor, R>),
     #[cfg(feature = "tokio")]
     Tokio(TokioTaskHandle<R>),
+    
+    #[doc(hidden)]
+    _Macos(std::convert::Infallible, std::marker::PhantomData<fn() -> R>),
 }
 
 impl<R: Send + 'static> TaskHandle<R> {
@@ -175,6 +181,7 @@ impl<R: Send + 'static> TaskHandle<R> {
             TaskHandle::Handle(h) => h.detach(),
             #[cfg(feature = "tokio")]
             TaskHandle::Tokio(t) => t.detach(),
+            _ => unreachable!(),
         }
     }
 
@@ -190,6 +197,7 @@ impl<R: Send + 'static> TaskHandle<R> {
             TaskHandle::Handle(h) => h.cancel().await,
             #[cfg(feature = "tokio")]
             TaskHandle::Tokio(t) => t.cancel().await,
+            _ => unreachable!(),
         }
     }
 }
@@ -207,6 +215,7 @@ impl<R: 'static> Future for TaskHandle<R> {
             TaskHandle::Handle(h) => Pin::new(h).poll(cx),
             #[cfg(feature = "tokio")]
             TaskHandle::Tokio(t) => Pin::new(t).poll(cx),
+            _ => unreachable!(),
         }
     }
 }
@@ -340,6 +349,9 @@ pub enum Executor {
     Overlapped(Arc<RawExecutor<windows::HandleReactor>>),
     #[cfg(feature = "tokio")]
     Tokio(TokioExecutor),
+    
+    #[doc(hidden)]
+    _Macos(std::convert::Infallible),
 }
 
 impl Executor {
@@ -371,6 +383,13 @@ impl Executor {
             }
             #[cfg(feature = "tokio")]
             ExecutorKind::Tokio => Executor::Tokio(TokioExecutor::new()?),
+            
+            ExecutorKind::SysVariants(ExecutorKindSys::Kqueue) => {
+                return Err(crate::AsyncError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "kqueue async executor not yet implemented on macOS",
+                )));
+            }
         })
     }
 
@@ -412,6 +431,7 @@ impl Executor {
             Executor::Overlapped(ex) => ex.async_from(f),
             #[cfg(feature = "tokio")]
             Executor::Tokio(ex) => ex.async_from(f),
+            _ => unreachable!(),
         }
     }
 
@@ -475,6 +495,7 @@ impl Executor {
             Executor::Overlapped(ex) => ex.spawn(f),
             #[cfg(feature = "tokio")]
             Executor::Tokio(ex) => ex.spawn(f),
+            _ => unreachable!(),
         }
     }
 
@@ -521,6 +542,7 @@ impl Executor {
             Executor::Overlapped(ex) => ex.spawn_local(f),
             #[cfg(feature = "tokio")]
             Executor::Tokio(ex) => ex.spawn_local(f),
+            _ => unreachable!(),
         }
     }
 
@@ -569,6 +591,7 @@ impl Executor {
             Executor::Overlapped(ex) => ex.spawn_blocking(f),
             #[cfg(feature = "tokio")]
             Executor::Tokio(ex) => ex.spawn_blocking(f),
+            _ => unreachable!(),
         }
     }
 
@@ -648,6 +671,7 @@ impl Executor {
             Executor::Overlapped(ex) => ex.run_until(f),
             #[cfg(feature = "tokio")]
             Executor::Tokio(ex) => ex.run_until(f),
+            _ => unreachable!(),
         }
     }
 }
@@ -660,6 +684,7 @@ impl AsRawDescriptors for Executor {
             Executor::Uring(ex) => ex.as_raw_descriptors(),
             #[cfg(feature = "tokio")]
             Executor::Tokio(ex) => ex.as_raw_descriptors(),
+            _ => unreachable!(),
         }
     }
 }

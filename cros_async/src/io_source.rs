@@ -33,6 +33,11 @@ pub enum IoSource<F: base::AsRawDescriptor> {
     Overlapped(OverlappedSource<F>),
     #[cfg(feature = "tokio")]
     Tokio(TokioSource<F>),
+    // macOS: stub variant that can never be constructed (uninhabited inner type).
+    // This ensures the enum is non-empty and match arms compile.
+    #[cfg(target_os = "macos")]
+    #[doc(hidden)]
+    _Macos(std::convert::Infallible, std::marker::PhantomData<F>),
 }
 
 static_assertions::assert_impl_all!(IoSource<std::fs::File>: Send, Sync);
@@ -42,17 +47,21 @@ static_assertions::assert_impl_all!(IoSource<std::fs::File>: Send, Sync);
 /// `await_on_inner(io_source, method, ...)` => `inner_source.method(...).await`
 macro_rules! await_on_inner {
     ($x:ident, $method:ident $(, $args:expr)*) => {
-        match $x {
-            #[cfg(any(target_os = "android", target_os = "linux"))]
-            IoSource::Uring(x) => UringSource::$method(x, $($args),*).await,
-            #[cfg(any(target_os = "android", target_os = "linux"))]
-            IoSource::Epoll(x) => PollSource::$method(x, $($args),*).await,
-            #[cfg(windows)]
-            IoSource::Handle(x) => HandleSource::$method(x, $($args),*).await,
-            #[cfg(windows)]
-            IoSource::Overlapped(x) => OverlappedSource::$method(x, $($args),*).await,
-            #[cfg(feature = "tokio")]
-            IoSource::Tokio(x) => TokioSource::$method(x, $($args),*).await,
+        {
+            #[allow(unreachable_patterns)]
+            match $x {
+                #[cfg(any(target_os = "android", target_os = "linux"))]
+                IoSource::Uring(x) => UringSource::$method(x, $($args),*).await,
+                #[cfg(any(target_os = "android", target_os = "linux"))]
+                IoSource::Epoll(x) => PollSource::$method(x, $($args),*).await,
+                #[cfg(windows)]
+                IoSource::Handle(x) => HandleSource::$method(x, $($args),*).await,
+                #[cfg(windows)]
+                IoSource::Overlapped(x) => OverlappedSource::$method(x, $($args),*).await,
+                #[cfg(feature = "tokio")]
+                IoSource::Tokio(x) => TokioSource::$method(x, $($args),*).await,
+                _ => unreachable!(),
+            }
         }
     };
 }
@@ -62,17 +71,21 @@ macro_rules! await_on_inner {
 /// `on_inner(io_source, method, ...)` => `inner_source.method(...)`
 macro_rules! on_inner {
     ($x:ident, $method:ident $(, $args:expr)*) => {
-        match $x {
-            #[cfg(any(target_os = "android", target_os = "linux"))]
-            IoSource::Uring(x) => UringSource::$method(x, $($args),*),
-            #[cfg(any(target_os = "android", target_os = "linux"))]
-            IoSource::Epoll(x) => PollSource::$method(x, $($args),*),
-            #[cfg(windows)]
-            IoSource::Handle(x) => HandleSource::$method(x, $($args),*),
-            #[cfg(windows)]
-            IoSource::Overlapped(x) => OverlappedSource::$method(x, $($args),*),
-            #[cfg(feature = "tokio")]
-            IoSource::Tokio(x) => TokioSource::$method(x, $($args),*),
+        {
+            #[allow(unreachable_patterns)]
+            match $x {
+                #[cfg(any(target_os = "android", target_os = "linux"))]
+                IoSource::Uring(x) => UringSource::$method(x, $($args),*),
+                #[cfg(any(target_os = "android", target_os = "linux"))]
+                IoSource::Epoll(x) => PollSource::$method(x, $($args),*),
+                #[cfg(windows)]
+                IoSource::Handle(x) => HandleSource::$method(x, $($args),*),
+                #[cfg(windows)]
+                IoSource::Overlapped(x) => OverlappedSource::$method(x, $($args),*),
+                #[cfg(feature = "tokio")]
+                IoSource::Tokio(x) => TokioSource::$method(x, $($args),*),
+                _ => unreachable!(),
+            }
         }
     };
 }

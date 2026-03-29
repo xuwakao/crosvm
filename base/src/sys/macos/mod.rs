@@ -12,6 +12,7 @@ use crate::MmapError;
 
 mod event;
 pub(in crate::sys::macos) mod kqueue;
+pub(crate) mod mmap;
 mod net;
 mod timer;
 
@@ -102,51 +103,7 @@ impl<T: crate::EventToken> crate::AsRawDescriptor for EventContext<T> {
     }
 }
 
-pub struct MemoryMappingArena {}
-
-#[derive(Debug)]
-pub struct MemoryMapping {}
-
-impl MemoryMapping {
-    pub fn size(&self) -> usize {
-        todo!();
-    }
-    pub(crate) fn range_end(&self, _offset: usize, _count: usize) -> Result<usize, MmapError> {
-        todo!();
-    }
-    pub fn msync(&self) -> Result<(), MmapError> {
-        todo!();
-    }
-    pub fn new_protection_fixed(
-        _addr: *mut u8,
-        _size: usize,
-        _prot: crate::Protection,
-    ) -> Result<MemoryMapping, MmapError> {
-        todo!();
-    }
-    /// # Safety
-    ///
-    /// unimplemented, always aborts
-    pub unsafe fn from_descriptor_offset_protection_fixed(
-        _addr: *mut u8,
-        _fd: &dyn crate::AsRawDescriptor,
-        _size: usize,
-        _offset: u64,
-        _prot: crate::Protection,
-    ) -> Result<MemoryMapping, MmapError> {
-        todo!();
-    }
-}
-
-// SAFETY: Unimplemented, always aborts
-unsafe impl crate::MappedRegion for MemoryMapping {
-    fn as_ptr(&self) -> *mut u8 {
-        todo!();
-    }
-    fn size(&self) -> usize {
-        todo!();
-    }
-}
+pub use mmap::*;
 
 pub mod ioctl {
     pub type IoctlNr = std::ffi::c_ulong;
@@ -235,7 +192,7 @@ pub mod syslog {
                 Option<Box<dyn crate::syslog::Log + Send>>,
                 Option<crate::RawDescriptor>,
             ),
-            crate::syslog::Error,
+            &'static crate::syslog::Error,
         > {
             todo!();
         }

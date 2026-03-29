@@ -1,0 +1,316 @@
+// Copyright 2026 The Aetheria Authors
+// SPDX-License-Identifier: BSD-3-Clause
+//
+// Rust FFI bindings for Apple Hypervisor.framework (ARM64 / Apple Silicon).
+//
+// Reference: https://developer.apple.com/documentation/hypervisor
+// These bindings cover the subset of HVF API needed for crosvm's hypervisor backend.
+
+#![allow(non_camel_case_types)]
+#![allow(dead_code)]
+
+use std::ffi::c_void;
+
+/// HVF return type — 0 is success.
+pub type hv_return_t = i32;
+
+/// HVF VM configuration handle.
+pub type hv_vm_config_t = *mut c_void;
+
+/// HVF vCPU instance handle.
+pub type hv_vcpu_t = u64;
+
+/// HVF vCPU configuration handle.
+pub type hv_vcpu_config_t = *mut c_void;
+
+// ============================================================================
+// Return codes
+// ============================================================================
+
+pub const HV_SUCCESS: hv_return_t = 0;
+pub const HV_ERROR: hv_return_t = -1; // 0xfaf1
+pub const HV_BUSY: hv_return_t = -2;
+pub const HV_BAD_ARGUMENT: hv_return_t = -3;
+pub const HV_NO_RESOURCES: hv_return_t = -5;
+pub const HV_NO_DEVICE: hv_return_t = -6;
+pub const HV_DENIED: hv_return_t = -7;
+pub const HV_UNSUPPORTED: hv_return_t = -8;
+
+// ============================================================================
+// Memory permissions
+// ============================================================================
+
+pub type hv_memory_flags_t = u64;
+
+pub const HV_MEMORY_READ: hv_memory_flags_t = 1 << 0;
+pub const HV_MEMORY_WRITE: hv_memory_flags_t = 1 << 1;
+pub const HV_MEMORY_EXEC: hv_memory_flags_t = 1 << 2;
+
+// ============================================================================
+// vCPU exit reason
+// ============================================================================
+
+pub type hv_exit_reason_t = u32;
+
+pub const HV_EXIT_REASON_CANCELED: hv_exit_reason_t = 0;
+pub const HV_EXIT_REASON_EXCEPTION: hv_exit_reason_t = 1;
+pub const HV_EXIT_REASON_VTIMER_ACTIVATED: hv_exit_reason_t = 2;
+pub const HV_EXIT_REASON_UNKNOWN: hv_exit_reason_t = 3;
+
+// ============================================================================
+// ARM64 Exception Classes (EC field of ESR_EL2, bits [31:26])
+// ============================================================================
+
+pub const EC_WFX_TRAP: u32 = 0x01;
+pub const EC_AA32_HVC: u32 = 0x12;
+pub const EC_AA32_SMC: u32 = 0x13;
+pub const EC_AA64_HVC: u32 = 0x16;
+pub const EC_AA64_SMC: u32 = 0x17;
+pub const EC_SYSTEMREGISTERTRAP: u32 = 0x18;
+pub const EC_INSNABORT: u32 = 0x20;
+pub const EC_INSNABORT_SAME_EL: u32 = 0x21;
+pub const EC_DATAABORT: u32 = 0x24;
+pub const EC_DATAABORT_SAME_EL: u32 = 0x25;
+pub const EC_BREAKPOINT: u32 = 0x30;
+pub const EC_BREAKPOINT_SAME_EL: u32 = 0x31;
+pub const EC_SOFTWARESTEP: u32 = 0x32;
+pub const EC_SOFTWARESTEP_SAME_EL: u32 = 0x33;
+pub const EC_WATCHPOINT: u32 = 0x34;
+pub const EC_WATCHPOINT_SAME_EL: u32 = 0x35;
+pub const EC_AA64_BKPT: u32 = 0x3c;
+
+// ============================================================================
+// Syndrome field helpers (for EC_DATAABORT)
+// ============================================================================
+
+/// Instruction Syndrome Valid bit
+pub const ARM_EL_ISV: u64 = 1 << 24;
+
+/// Extract Exception Class from syndrome
+#[inline]
+pub fn syn_get_ec(syndrome: u64) -> u32 {
+    ((syndrome >> 26) & 0x3f) as u32
+}
+
+/// Extract data abort fields from syndrome
+#[inline]
+pub fn data_abort_isv(syndrome: u64) -> bool {
+    (syndrome & ARM_EL_ISV) != 0
+}
+
+#[inline]
+pub fn data_abort_iswrite(syndrome: u64) -> bool {
+    ((syndrome >> 6) & 1) != 0
+}
+
+#[inline]
+pub fn data_abort_sas(syndrome: u64) -> u32 {
+    ((syndrome >> 22) & 3) as u32
+}
+
+#[inline]
+pub fn data_abort_srt(syndrome: u64) -> u32 {
+    ((syndrome >> 16) & 0x1f) as u32
+}
+
+#[inline]
+pub fn data_abort_s1ptw(syndrome: u64) -> bool {
+    ((syndrome >> 7) & 1) != 0
+}
+
+/// System register trap: extract read/write direction
+#[inline]
+pub fn sysreg_isread(syndrome: u64) -> bool {
+    (syndrome & 1) != 0
+}
+
+/// System register trap: extract target register
+#[inline]
+pub fn sysreg_rt(syndrome: u64) -> u32 {
+    ((syndrome >> 5) & 0x1f) as u32
+}
+
+/// WFx trap: is it WFE (true) or WFI (false)?
+#[inline]
+pub fn wfx_is_wfe(syndrome: u64) -> bool {
+    (syndrome & 1) != 0
+}
+
+// ============================================================================
+// vCPU exit info structure (returned by hv_vcpu_run)
+// ============================================================================
+
+#[repr(C)]
+#[derive(Debug, Default)]
+pub struct hv_vcpu_exit_exception_t {
+    pub syndrome: u64,
+    pub virtual_address: u64,
+    pub physical_address: u64,
+}
+
+#[repr(C)]
+pub struct hv_vcpu_exit_t {
+    pub reason: hv_exit_reason_t,
+    pub exception: hv_vcpu_exit_exception_t,
+}
+
+// ============================================================================
+// General-purpose registers
+// ============================================================================
+
+pub type hv_reg_t = u32;
+
+pub const HV_REG_X0: hv_reg_t = 0;
+pub const HV_REG_X1: hv_reg_t = 1;
+pub const HV_REG_X2: hv_reg_t = 2;
+pub const HV_REG_X3: hv_reg_t = 3;
+pub const HV_REG_X4: hv_reg_t = 4;
+pub const HV_REG_X5: hv_reg_t = 5;
+pub const HV_REG_X6: hv_reg_t = 6;
+pub const HV_REG_X7: hv_reg_t = 7;
+pub const HV_REG_X8: hv_reg_t = 8;
+pub const HV_REG_X9: hv_reg_t = 9;
+pub const HV_REG_X10: hv_reg_t = 10;
+pub const HV_REG_X11: hv_reg_t = 11;
+pub const HV_REG_X12: hv_reg_t = 12;
+pub const HV_REG_X13: hv_reg_t = 13;
+pub const HV_REG_X14: hv_reg_t = 14;
+pub const HV_REG_X15: hv_reg_t = 15;
+pub const HV_REG_X16: hv_reg_t = 16;
+pub const HV_REG_X17: hv_reg_t = 17;
+pub const HV_REG_X18: hv_reg_t = 18;
+pub const HV_REG_X19: hv_reg_t = 19;
+pub const HV_REG_X20: hv_reg_t = 20;
+pub const HV_REG_X21: hv_reg_t = 21;
+pub const HV_REG_X22: hv_reg_t = 22;
+pub const HV_REG_X23: hv_reg_t = 23;
+pub const HV_REG_X24: hv_reg_t = 24;
+pub const HV_REG_X25: hv_reg_t = 25;
+pub const HV_REG_X26: hv_reg_t = 26;
+pub const HV_REG_X27: hv_reg_t = 27;
+pub const HV_REG_X28: hv_reg_t = 28;
+pub const HV_REG_X29: hv_reg_t = 29;  // FP
+pub const HV_REG_X30: hv_reg_t = 30;  // LR
+pub const HV_REG_PC: hv_reg_t = 31;
+pub const HV_REG_FPCR: hv_reg_t = 32;
+pub const HV_REG_FPSR: hv_reg_t = 33;
+pub const HV_REG_CPSR: hv_reg_t = 34;
+
+// ============================================================================
+// System registers (subset needed for VMM operation)
+// ============================================================================
+
+pub type hv_sys_reg_t = u16;
+
+pub const HV_SYS_REG_SP_EL0: hv_sys_reg_t = 0xC208;
+pub const HV_SYS_REG_SP_EL1: hv_sys_reg_t = 0xE208;
+pub const HV_SYS_REG_ELR_EL1: hv_sys_reg_t = 0xE201;
+pub const HV_SYS_REG_SPSR_EL1: hv_sys_reg_t = 0xE200;
+pub const HV_SYS_REG_VBAR_EL1: hv_sys_reg_t = 0xE600;
+pub const HV_SYS_REG_SCTLR_EL1: hv_sys_reg_t = 0xC080;
+pub const HV_SYS_REG_MAIR_EL1: hv_sys_reg_t = 0xE510;
+pub const HV_SYS_REG_TCR_EL1: hv_sys_reg_t = 0xE102;
+pub const HV_SYS_REG_TTBR0_EL1: hv_sys_reg_t = 0xE100;
+pub const HV_SYS_REG_TTBR1_EL1: hv_sys_reg_t = 0xE101;
+pub const HV_SYS_REG_MPIDR_EL1: hv_sys_reg_t = 0xC005;
+pub const HV_SYS_REG_MIDR_EL1: hv_sys_reg_t = 0xC000;
+pub const HV_SYS_REG_CNTV_CTL_EL0: hv_sys_reg_t = 0xDA19;
+pub const HV_SYS_REG_CNTV_CVAL_EL0: hv_sys_reg_t = 0xDA1A;
+
+// ============================================================================
+// Interrupt types
+// ============================================================================
+
+pub type hv_interrupt_type_t = u32;
+
+pub const HV_INTERRUPT_TYPE_IRQ: hv_interrupt_type_t = 0;
+pub const HV_INTERRUPT_TYPE_FIQ: hv_interrupt_type_t = 1;
+
+// ============================================================================
+// Hypervisor.framework C API bindings
+// ============================================================================
+
+#[link(name = "Hypervisor", kind = "framework")]
+extern "C" {
+    // --- VM management ---
+    pub fn hv_vm_create(config: hv_vm_config_t) -> hv_return_t;
+    pub fn hv_vm_destroy() -> hv_return_t;
+
+    // --- Memory management ---
+    pub fn hv_vm_map(
+        addr: *const c_void,
+        ipa: u64,
+        size: usize,
+        flags: hv_memory_flags_t,
+    ) -> hv_return_t;
+    pub fn hv_vm_unmap(ipa: u64, size: usize) -> hv_return_t;
+    pub fn hv_vm_protect(ipa: u64, size: usize, flags: hv_memory_flags_t) -> hv_return_t;
+
+    // --- vCPU management ---
+    pub fn hv_vcpu_create(
+        vcpu: *mut hv_vcpu_t,
+        exit: *mut *const hv_vcpu_exit_t,
+        config: hv_vcpu_config_t,
+    ) -> hv_return_t;
+    pub fn hv_vcpu_destroy(vcpu: hv_vcpu_t) -> hv_return_t;
+    pub fn hv_vcpu_run(vcpu: hv_vcpu_t) -> hv_return_t;
+
+    // --- Register access ---
+    pub fn hv_vcpu_get_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: *mut u64) -> hv_return_t;
+    pub fn hv_vcpu_set_reg(vcpu: hv_vcpu_t, reg: hv_reg_t, value: u64) -> hv_return_t;
+    pub fn hv_vcpu_get_sys_reg(
+        vcpu: hv_vcpu_t,
+        reg: hv_sys_reg_t,
+        value: *mut u64,
+    ) -> hv_return_t;
+    pub fn hv_vcpu_set_sys_reg(
+        vcpu: hv_vcpu_t,
+        reg: hv_sys_reg_t,
+        value: u64,
+    ) -> hv_return_t;
+
+    // --- SIMD/FP register access ---
+    pub fn hv_vcpu_get_simd_fp_reg(
+        vcpu: hv_vcpu_t,
+        reg: hv_reg_t,
+        value: *mut u128,
+    ) -> hv_return_t;
+    pub fn hv_vcpu_set_simd_fp_reg(
+        vcpu: hv_vcpu_t,
+        reg: hv_reg_t,
+        value: u128,
+    ) -> hv_return_t;
+
+    // --- Interrupt injection ---
+    pub fn hv_vcpu_set_pending_interrupt(
+        vcpu: hv_vcpu_t,
+        r#type: hv_interrupt_type_t,
+        pending: bool,
+    ) -> hv_return_t;
+    pub fn hv_vcpu_get_pending_interrupt(
+        vcpu: hv_vcpu_t,
+        r#type: hv_interrupt_type_t,
+        pending: *mut bool,
+    ) -> hv_return_t;
+
+    // --- Timer ---
+    pub fn hv_vcpu_set_vtimer_mask(vcpu: hv_vcpu_t, masked: bool) -> hv_return_t;
+    pub fn hv_vcpu_get_vtimer_offset(vcpu: hv_vcpu_t, offset: *mut u64) -> hv_return_t;
+    pub fn hv_vcpu_set_vtimer_offset(vcpu: hv_vcpu_t, offset: u64) -> hv_return_t;
+
+    // --- Debug ---
+    pub fn hv_vcpu_set_trap_debug_exceptions(vcpu: hv_vcpu_t, enable: bool) -> hv_return_t;
+}
+
+// ============================================================================
+// Safe wrapper helpers
+// ============================================================================
+
+/// Convert HVF return code to a Rust Result.
+pub fn hvf_result(ret: hv_return_t) -> std::result::Result<(), base::Error> {
+    if ret == HV_SUCCESS {
+        Ok(())
+    } else {
+        Err(base::Error::new(ret))
+    }
+}
