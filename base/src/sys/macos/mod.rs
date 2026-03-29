@@ -16,6 +16,7 @@ use crate::MmapError;
 
 mod event;
 mod file_traits;
+mod notifiers;
 pub mod ioctl_macros;
 pub(in crate::sys::macos) mod kqueue;
 pub(crate) mod mmap;

@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use base::Event;
 use sync::Mutex;
 
 use crate::acpi::ACPIPMError;
@@ -13,14 +14,15 @@ use crate::IrqLevelEvent;
 
 /// macOS does not have Netlink sockets for ACPI events.
 /// Returns None — ACPI host events are not available.
-pub(crate) fn get_acpi_event_sock() -> Result<Option<()>, ACPIPMError> {
+/// Uses Event as the socket type to satisfy AsRawDescriptor bounds.
+pub(crate) fn get_acpi_event_sock() -> Result<Option<Event>, ACPIPMError> {
     Ok(None)
 }
 
 /// No-op on macOS — no ACPI event socket to process.
 pub(crate) fn acpi_event_run(
     _sci_evt: &IrqLevelEvent,
-    _acpi_event_sock: &Option<()>,
+    _acpi_event_sock: &Option<Event>,
     _gpe0: &Arc<Mutex<GpeResource>>,
     _ignored_gpe: &[u32],
     _ac_adapter: &Option<Arc<Mutex<AcAdapter>>>,

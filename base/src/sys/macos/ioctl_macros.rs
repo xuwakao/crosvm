@@ -63,6 +63,16 @@ macro_rules! ioctl_ior_nr {
             ::std::mem::size_of::<$size>() as u32
         );
     };
+    ($name:ident, $ty:expr, $nr:expr, $size:ty, $($v:ident),+) => {
+        $crate::ioctl_ioc_nr!(
+            $name,
+            $crate::macos::ioctl_macros::_IOC_READ,
+            $ty,
+            $nr,
+            ::std::mem::size_of::<$size>() as u32,
+            $($v),+
+        );
+    };
 }
 
 #[macro_export]
@@ -74,6 +84,16 @@ macro_rules! ioctl_iow_nr {
             $ty,
             $nr,
             ::std::mem::size_of::<$size>() as u32
+        );
+    };
+    ($name:ident, $ty:expr, $nr:expr, $size:ty, $($v:ident),+) => {
+        $crate::ioctl_ioc_nr!(
+            $name,
+            $crate::macos::ioctl_macros::_IOC_WRITE,
+            $ty,
+            $nr,
+            ::std::mem::size_of::<$size>() as u32,
+            $($v),+
         );
     };
 }
