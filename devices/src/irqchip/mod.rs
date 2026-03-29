@@ -44,6 +44,12 @@ cfg_if::cfg_if! {
     }
 }
 
+// GIC constants for macOS HVF backend (same values as KVM).
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub const AARCH64_GIC_NR_SPIS: u32 = 32;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub const AARCH64_GIC_NR_IRQS: u32 = 288;
+
 cfg_if::cfg_if! {
     if #[cfg(target_arch = "x86_64")] {
         mod x86_64;

@@ -131,6 +131,11 @@ cfg_if::cfg_if! {
         pub use sys::macos;
         pub use macos::MemoryMappingBuilderUnix;
         pub use macos::pipe;
+        pub use macos::logical_core_capacity;
+        pub use macos::logical_core_cluster_id;
+        pub use macos::logical_core_frequencies_khz;
+        pub use macos::logical_core_max_freq_khz;
+        pub use macos::is_cpu_online;
     }
 }
 

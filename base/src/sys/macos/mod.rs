@@ -41,6 +41,53 @@ pub fn set_thread_name(name: &str) -> crate::errno::Result<()> {
     }
 }
 
+/// Returns the max frequency in kHz of the given logical core.
+/// On macOS, uses sysctl to get the CPU frequency (same for all cores).
+pub fn logical_core_max_freq_khz(_cpu_id: usize) -> crate::Result<u32> {
+    // macOS: use sysctl hw.cpufrequency_max (in Hz), convert to kHz.
+    let mut freq: u64 = 0;
+    let mut size = std::mem::size_of::<u64>();
+    let name = std::ffi::CString::new("hw.cpufrequency_max").unwrap();
+    // SAFETY: sysctlbyname with valid null-terminated name and correctly sized buffer.
+    let ret = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut freq as *mut u64 as *mut _,
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return Err(crate::Error::last());
+    }
+    Ok((freq / 1000) as u32)
+}
+
+/// Returns the supported frequencies in kHz of the given logical core.
+/// On macOS, returns just the max frequency (Apple Silicon doesn't expose frequency steps).
+pub fn logical_core_frequencies_khz(cpu_id: usize) -> crate::Result<Vec<u32>> {
+    Ok(vec![logical_core_max_freq_khz(cpu_id)?])
+}
+
+/// Returns the capacity (DMIPS/MHz) of the given logical core.
+/// On macOS, returns 1024 for all cores (default full capacity).
+pub fn logical_core_capacity(_cpu_id: usize) -> crate::Result<u32> {
+    Ok(1024)
+}
+
+/// Returns the cluster ID of the given logical core.
+/// On macOS, returns 0 (single cluster approximation).
+pub fn logical_core_cluster_id(_cpu_id: usize) -> crate::Result<u32> {
+    Ok(0)
+}
+
+/// Returns whether the given CPU is online.
+/// On macOS, all CPUs are always online (no CPU hotplug support).
+pub fn is_cpu_online(_cpu_id: usize) -> crate::Result<bool> {
+    Ok(true)
+}
+
 pub fn get_cpu_affinity() -> crate::errno::Result<Vec<usize>> {
     // macOS does not support getting CPU affinity. Return all CPUs.
     let count = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };

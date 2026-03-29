@@ -764,30 +764,37 @@ impl arch::LinuxArch for AArch64 {
 
         let pci_root = Arc::new(Mutex::new(pci));
         let pci_bus = Arc::new(Mutex::new(PciConfigMmio::new(pci_root.clone(), 8)));
-        let (platform_devices, _others): (Vec<_>, Vec<_>) = others
-            .into_iter()
-            .partition(|(dev, _)| dev.as_platform_device().is_some());
 
-        let platform_devices = platform_devices
-            .into_iter()
-            .map(|(dev, jail_orig)| (*(dev.into_platform_device().unwrap()), jail_orig))
-            .collect();
-        // vfio-platform is currently the only backend for PM of platform devices.
-        let mut dev_pm = components.vfio_platform_pm.then(DevicePowerManager::new);
-        let (platform_devices, mut platform_pid_debug_label_map, dev_resources) =
-            arch::sys::linux::generate_platform_bus(
-                platform_devices,
-                irq_chip.as_irq_chip_mut(),
-                &mmio_bus,
-                system_allocator,
-                &mut vm,
-                #[cfg(feature = "swap")]
-                swap_controller,
-                &mut dev_pm,
-                components.hv_cfg.protection_type,
-            )
-            .map_err(Error::CreatePlatformBus)?;
-        pid_debug_label_map.append(&mut platform_pid_debug_label_map);
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        let (platform_devices, dev_resources, mut dev_pm) = {
+            let (platform_devices, _others): (Vec<_>, Vec<_>) = others
+                .into_iter()
+                .partition(|(dev, _)| dev.as_platform_device().is_some());
+
+            let platform_devices = platform_devices
+                .into_iter()
+                .map(|(dev, jail_orig)| (*(dev.into_platform_device().unwrap()), jail_orig))
+                .collect();
+            // vfio-platform is currently the only backend for PM of platform devices.
+            let mut dev_pm = components.vfio_platform_pm.then(DevicePowerManager::new);
+            let (platform_devices, mut platform_pid_debug_label_map, dev_resources) =
+                arch::sys::linux::generate_platform_bus(
+                    platform_devices,
+                    irq_chip.as_irq_chip_mut(),
+                    &mmio_bus,
+                    system_allocator,
+                    &mut vm,
+                    #[cfg(feature = "swap")]
+                    swap_controller,
+                    &mut dev_pm,
+                    components.hv_cfg.protection_type,
+                )
+                .map_err(Error::CreatePlatformBus)?;
+            pid_debug_label_map.append(&mut platform_pid_debug_label_map);
+            (platform_devices, dev_resources, dev_pm)
+        };
+        #[cfg(target_os = "macos")]
+        let mut dev_pm: Option<DevicePowerManager> = None;
 
         if components.smccc_trng {
             let arced_trng = Arc::new(SmcccTrng::new());
@@ -976,6 +983,7 @@ impl arch::LinuxArch for AArch64 {
             true, // prefetchable
         );
 
+        #[cfg(any(target_os = "android", target_os = "linux"))]
         let (bat_control, bat_mmio_base_and_irq) = match bat_type {
             Some(BatteryType::Goldfish) => {
                 let bat_irq = AARCH64_BAT_IRQ;
@@ -1003,13 +1011,26 @@ impl arch::LinuxArch for AArch64 {
             }
             None => (None, None),
         };
+        #[cfg(target_os = "macos")]
+        let (bat_control, bat_mmio_base_and_irq): (Option<BatControl>, Option<(u64, u32)>) =
+            (None, None);
 
         let vmwdt_cfg = fdt::VmWdtConfig {
             base: AARCH64_VMWDT_ADDR,
             size: AARCH64_VMWDT_SIZE,
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             clock_hz: VMWDT_DEFAULT_CLOCK_HZ,
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             timeout_sec: VMWDT_DEFAULT_TIMEOUT_SEC,
+            #[cfg(target_os = "macos")]
+            clock_hz: 10,
+            #[cfg(target_os = "macos")]
+            timeout_sec: 10,
         };
+
+        let cmdline_str = cmdline
+            .as_str_with_max_len(AARCH64_CMDLINE_MAX_SIZE - 1)
+            .map_err(Error::Cmdline)?;
 
         fdt::create_fdt(
             AARCH64_FDT_MAX_SIZE as usize,
@@ -1017,16 +1038,18 @@ impl arch::LinuxArch for AArch64 {
             pci_irqs,
             pci_cfg,
             &pci_ranges,
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             dev_resources,
             vcpu_count as u32,
             &|n| get_vcpu_mpidr_aff(&vcpus, n),
             components.cpu_clusters,
             components.cpu_capacity,
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             components.cpu_frequencies,
+            #[cfg(target_os = "macos")]
+            BTreeMap::new(),
             fdt_address,
-            cmdline
-                .as_str_with_max_len(AARCH64_CMDLINE_MAX_SIZE - 1)
-                .map_err(Error::Cmdline)?,
+            cmdline_str,
             payload.address_range(),
             initrd,
             components.android_fstab,
@@ -1047,7 +1070,10 @@ impl arch::LinuxArch for AArch64 {
             components.dynamic_power_coefficient,
             device_tree_overlays,
             &serial_devices,
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             components.virt_cpufreq_v2,
+            #[cfg(target_os = "macos")]
+            false,
         )
         .map_err(Error::CreateFdt)?;
 
@@ -1079,6 +1105,7 @@ impl arch::LinuxArch for AArch64 {
             pm: None,
             resume_notify_devices: Vec::new(),
             root_config: pci_root,
+            #[cfg(any(target_os = "android", target_os = "linux"))]
             platform_devices,
             hotplug_bus: BTreeMap::new(),
             devices_thread: None,
@@ -1105,7 +1132,7 @@ impl arch::LinuxArch for AArch64 {
     fn register_pci_device<V: VmAArch64, Vcpu: VcpuAArch64>(
         _linux: &mut RunnableLinuxVm<V, Vcpu>,
         _device: Box<dyn PciDevice>,
-        _minijail: Option<Minijail>,
+        #[cfg(any(target_os = "android", target_os = "linux"))] _minijail: Option<Minijail>,
         _resources: &mut SystemAllocator,
         _tube: &mpsc::Sender<PciRootCommand>,
         #[cfg(feature = "swap")] _swap_controller: &mut Option<swap::SwapController>,
@@ -1401,28 +1428,31 @@ impl AArch64 {
         )
         .expect("failed to add rtc device");
 
-        let vmwdt_evt = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
-        let vm_wdt = devices::vmwdt::Vmwdt::new(
-            vcpu_count,
-            vm_evt_wrtube.try_clone().unwrap(),
-            vmwdt_evt.try_clone().map_err(Error::CloneEvent)?,
-            vmwdt_request_tube,
-        )
-        .map_err(Error::CreateVmwdtDevice)?;
-        irq_chip
-            .register_edge_irq_event(
-                AARCH64_VMWDT_IRQ,
-                &vmwdt_evt,
-                IrqEventSource::from_device(&vm_wdt),
+        #[cfg(any(target_os = "android", target_os = "linux"))]
+        {
+            let vmwdt_evt = devices::IrqEdgeEvent::new().map_err(Error::CreateEvent)?;
+            let vm_wdt = devices::vmwdt::Vmwdt::new(
+                vcpu_count,
+                vm_evt_wrtube.try_clone().unwrap(),
+                vmwdt_evt.try_clone().map_err(Error::CloneEvent)?,
+                vmwdt_request_tube,
             )
-            .map_err(Error::RegisterIrqfd)?;
+            .map_err(Error::CreateVmwdtDevice)?;
+            irq_chip
+                .register_edge_irq_event(
+                    AARCH64_VMWDT_IRQ,
+                    &vmwdt_evt,
+                    IrqEventSource::from_device(&vm_wdt),
+                )
+                .map_err(Error::RegisterIrqfd)?;
 
-        bus.insert(
-            Arc::new(Mutex::new(vm_wdt)),
-            AARCH64_VMWDT_ADDR,
-            AARCH64_VMWDT_SIZE,
-        )
-        .expect("failed to add vmwdt device");
+            bus.insert(
+                Arc::new(Mutex::new(vm_wdt)),
+                AARCH64_VMWDT_ADDR,
+                AARCH64_VMWDT_SIZE,
+            )
+            .expect("failed to add vmwdt device");
+        }
 
         Ok(())
     }
