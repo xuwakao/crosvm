@@ -166,8 +166,8 @@ pub enum TaskHandle<R> {
     #[cfg(feature = "tokio")]
     Tokio(TokioTaskHandle<R>),
     
-    #[doc(hidden)]
-    _Macos(std::convert::Infallible, std::marker::PhantomData<fn() -> R>),
+    #[cfg(target_os = "macos")]
+    Kqueue(common_executor::RawTaskHandle<crate::sys::macos::KqueueReactor, R>),
 }
 
 impl<R: Send + 'static> TaskHandle<R> {
@@ -181,6 +181,8 @@ impl<R: Send + 'static> TaskHandle<R> {
             TaskHandle::Handle(h) => h.detach(),
             #[cfg(feature = "tokio")]
             TaskHandle::Tokio(t) => t.detach(),
+            #[cfg(target_os = "macos")]
+            TaskHandle::Kqueue(k) => k.detach(),
             _ => unreachable!(),
         }
     }
@@ -197,6 +199,8 @@ impl<R: Send + 'static> TaskHandle<R> {
             TaskHandle::Handle(h) => h.cancel().await,
             #[cfg(feature = "tokio")]
             TaskHandle::Tokio(t) => t.cancel().await,
+            #[cfg(target_os = "macos")]
+            TaskHandle::Kqueue(k) => k.cancel().await,
             _ => unreachable!(),
         }
     }
@@ -215,6 +219,8 @@ impl<R: 'static> Future for TaskHandle<R> {
             TaskHandle::Handle(h) => Pin::new(h).poll(cx),
             #[cfg(feature = "tokio")]
             TaskHandle::Tokio(t) => Pin::new(t).poll(cx),
+            #[cfg(target_os = "macos")]
+            TaskHandle::Kqueue(k) => Pin::new(k).poll(cx),
             _ => unreachable!(),
         }
     }
@@ -350,8 +356,8 @@ pub enum Executor {
     #[cfg(feature = "tokio")]
     Tokio(TokioExecutor),
     
-    #[doc(hidden)]
-    _Macos(std::convert::Infallible),
+    #[cfg(target_os = "macos")]
+    Kqueue(Arc<RawExecutor<crate::sys::macos::KqueueReactor>>),
 }
 
 impl Executor {
@@ -384,11 +390,9 @@ impl Executor {
             #[cfg(feature = "tokio")]
             ExecutorKind::Tokio => Executor::Tokio(TokioExecutor::new()?),
             
+            #[cfg(target_os = "macos")]
             ExecutorKind::SysVariants(ExecutorKindSys::Kqueue) => {
-                return Err(crate::AsyncError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "kqueue async executor not yet implemented on macOS",
-                )));
+                Executor::Kqueue(RawExecutor::new()?)
             }
         })
     }
@@ -431,6 +435,8 @@ impl Executor {
             Executor::Overlapped(ex) => ex.async_from(f),
             #[cfg(feature = "tokio")]
             Executor::Tokio(ex) => ex.async_from(f),
+            #[cfg(target_os = "macos")]
+            Executor::Kqueue(ex) => ex.async_from(f),
             _ => unreachable!(),
         }
     }
@@ -495,6 +501,8 @@ impl Executor {
             Executor::Overlapped(ex) => ex.spawn(f),
             #[cfg(feature = "tokio")]
             Executor::Tokio(ex) => ex.spawn(f),
+            #[cfg(target_os = "macos")]
+            Executor::Kqueue(ex) => ex.spawn(f),
             _ => unreachable!(),
         }
     }
@@ -542,6 +550,8 @@ impl Executor {
             Executor::Overlapped(ex) => ex.spawn_local(f),
             #[cfg(feature = "tokio")]
             Executor::Tokio(ex) => ex.spawn_local(f),
+            #[cfg(target_os = "macos")]
+            Executor::Kqueue(ex) => ex.spawn_local(f),
             _ => unreachable!(),
         }
     }
@@ -591,6 +601,8 @@ impl Executor {
             Executor::Overlapped(ex) => ex.spawn_blocking(f),
             #[cfg(feature = "tokio")]
             Executor::Tokio(ex) => ex.spawn_blocking(f),
+            #[cfg(target_os = "macos")]
+            Executor::Kqueue(ex) => ex.spawn_blocking(f),
             _ => unreachable!(),
         }
     }
@@ -671,6 +683,8 @@ impl Executor {
             Executor::Overlapped(ex) => ex.run_until(f),
             #[cfg(feature = "tokio")]
             Executor::Tokio(ex) => ex.run_until(f),
+            #[cfg(target_os = "macos")]
+            Executor::Kqueue(ex) => ex.run_until(f),
             _ => unreachable!(),
         }
     }

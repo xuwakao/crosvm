@@ -2,17 +2,20 @@
 // SPDX-License-Identifier: BSD-3-Clause
 //
 // macOS platform module for cros_async.
-// This is a minimal stub to allow compilation on macOS.
-// Full async I/O (kqueue-based) implementation is future work.
+// Provides a kqueue-based async executor and IO source.
 
 pub mod async_types;
 mod error;
 pub mod event;
 pub mod executor;
+pub mod kqueue_reactor;
+pub mod kqueue_source;
 mod timer;
 
 pub use error::AsyncErrorSys;
 pub use executor::ExecutorKindSys;
+pub(crate) use kqueue_reactor::KqueueReactor;
+pub use kqueue_source::KqueueSource;
 
 use crate::Error;
 

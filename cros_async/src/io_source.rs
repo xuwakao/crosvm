@@ -10,6 +10,8 @@ use base::AsRawDescriptor;
 use crate::sys::linux::PollSource;
 #[cfg(any(target_os = "android", target_os = "linux"))]
 use crate::sys::linux::UringSource;
+#[cfg(target_os = "macos")]
+use crate::sys::macos::KqueueSource;
 #[cfg(feature = "tokio")]
 use crate::sys::platform::tokio_source::TokioSource;
 #[cfg(windows)]
@@ -33,11 +35,8 @@ pub enum IoSource<F: base::AsRawDescriptor> {
     Overlapped(OverlappedSource<F>),
     #[cfg(feature = "tokio")]
     Tokio(TokioSource<F>),
-    // macOS: stub variant that can never be constructed (uninhabited inner type).
-    // This ensures the enum is non-empty and match arms compile.
     #[cfg(target_os = "macos")]
-    #[doc(hidden)]
-    _Macos(std::convert::Infallible, std::marker::PhantomData<F>),
+    Kqueue(KqueueSource<F>),
 }
 
 static_assertions::assert_impl_all!(IoSource<std::fs::File>: Send, Sync);
@@ -60,6 +59,8 @@ macro_rules! await_on_inner {
                 IoSource::Overlapped(x) => OverlappedSource::$method(x, $($args),*).await,
                 #[cfg(feature = "tokio")]
                 IoSource::Tokio(x) => TokioSource::$method(x, $($args),*).await,
+                #[cfg(target_os = "macos")]
+                IoSource::Kqueue(x) => KqueueSource::$method(x, $($args),*).await,
                 _ => unreachable!(),
             }
         }
@@ -84,6 +85,8 @@ macro_rules! on_inner {
                 IoSource::Overlapped(x) => OverlappedSource::$method(x, $($args),*),
                 #[cfg(feature = "tokio")]
                 IoSource::Tokio(x) => TokioSource::$method(x, $($args),*),
+                #[cfg(target_os = "macos")]
+                IoSource::Kqueue(x) => KqueueSource::$method(x, $($args),*),
                 _ => unreachable!(),
             }
         }
@@ -212,6 +215,10 @@ mod tests {
         // TODO: Test OverlappedSource. It requires files to be opened specially, so this test
         // fixture needs to be refactored first.
         vec![ExecutorKindSys::Handle.into()]
+    }
+    #[cfg(target_os = "macos")]
+    fn all_kinds() -> Vec<ExecutorKind> {
+        vec![ExecutorKindSys::Kqueue.into()]
     }
 
     fn tmpfile_with_contents(bytes: &[u8]) -> File {

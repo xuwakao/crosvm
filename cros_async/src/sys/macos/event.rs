@@ -1,27 +1,35 @@
 // Copyright 2026 The Aetheria Authors
 // SPDX-License-Identifier: BSD-3-Clause
 //
-// macOS stub for cros_async event.
+// macOS EventAsync implementation using kqueue executor.
 
 use base::Event;
 
+use crate::AsyncError;
 use crate::AsyncResult;
 use crate::EventAsync;
 use crate::Executor;
 
 impl EventAsync {
-    pub fn new(_event: Event, _ex: &Executor) -> AsyncResult<EventAsync> {
-        Err(crate::AsyncError::Io(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "async I/O not supported on macOS",
-        )))
+    pub fn new(event: Event, ex: &Executor) -> AsyncResult<EventAsync> {
+        ex.async_from(event)
+            .map(|io_source| EventAsync { io_source })
     }
 
+    /// Gets the next value from the eventfd.
     pub async fn next_val(&self) -> AsyncResult<u64> {
-        unreachable!("EventAsync cannot be constructed on macOS")
+        let (n, v) = self
+            .io_source
+            .read_to_vec(None, 0u64.to_ne_bytes().to_vec())
+            .await?;
+        if n != 8 {
+            return Err(AsyncError::EventAsync(base::Error::new(libc::ENODATA)));
+        }
+        Ok(u64::from_ne_bytes(v.try_into().unwrap()))
     }
 
+    /// Gets the next value from the eventfd and resets the count.
     pub async fn next_val_reset(&self) -> AsyncResult<u64> {
-        unreachable!("EventAsync cannot be constructed on macOS")
+        self.next_val().await
     }
 }
