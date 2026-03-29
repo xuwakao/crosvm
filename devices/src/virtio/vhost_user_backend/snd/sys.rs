@@ -9,6 +9,7 @@ cfg_if::cfg_if! {
     } else if #[cfg(windows)] {
         pub mod windows;
         use windows as platform;
+    } else if #[cfg(target_os = "macos")] {
     }
 }
 

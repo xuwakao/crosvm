@@ -16,6 +16,7 @@ use crate::MmapError;
 
 mod event;
 mod file_traits;
+pub mod ioctl_macros;
 pub(in crate::sys::macos) mod kqueue;
 pub(crate) mod mmap;
 mod net;
@@ -284,6 +285,7 @@ impl<T: crate::EventToken> crate::AsRawDescriptor for EventContext<T> {
     }
 }
 
+pub use ioctl::IoctlNr;
 pub use mmap::*;
 
 pub mod ioctl {

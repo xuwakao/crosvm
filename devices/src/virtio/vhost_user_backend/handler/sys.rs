@@ -7,5 +7,6 @@ cfg_if::cfg_if! {
         pub mod linux;
     } else if #[cfg(windows)] {
         pub mod windows;
+    } else if #[cfg(target_os = "macos")] {
     }
 }
