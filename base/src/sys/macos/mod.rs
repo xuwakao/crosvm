@@ -15,6 +15,7 @@ use crate::unix::Pid;
 use crate::MmapError;
 
 mod event;
+mod file_traits;
 pub(in crate::sys::macos) mod kqueue;
 pub(crate) mod mmap;
 mod net;

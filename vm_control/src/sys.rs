@@ -19,6 +19,10 @@ cfg_if::cfg_if! {
         #[cfg(feature = "gpu")]
         pub use platform::gpu::WinMouseMode as MouseMode;
         pub use platform::InitialAudioSessionState;
+    } else if #[cfg(target_os = "macos")] {
+        pub mod macos;
+        use macos as platform;
+        pub use platform::{VmMemoryMappingRequest, VmMemoryMappingResponse, FsMappingRequest};
     } else {
         compile_error!("Unsupported platform");
     }

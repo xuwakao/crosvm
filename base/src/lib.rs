@@ -127,6 +127,13 @@ cfg_if::cfg_if! {
 }
 
 cfg_if::cfg_if! {
+    if #[cfg(target_os = "macos")] {
+        pub use sys::macos;
+        pub use macos::MemoryMappingBuilderUnix;
+    }
+}
+
+cfg_if::cfg_if! {
      if #[cfg(windows)] {
         pub use sys::windows;
 
