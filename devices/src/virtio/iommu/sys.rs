@@ -10,6 +10,8 @@ cfg_if::cfg_if! {
         mod windows;
         use windows as platform;
     } else if #[cfg(target_os = "macos")] {
+        pub(in crate::virtio::iommu) mod macos;
+        use macos as platform;
     }
 }
 

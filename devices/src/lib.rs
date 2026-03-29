@@ -180,6 +180,8 @@ cfg_if::cfg_if! {
         pub use self::virtio::vfio_wrapper;
 
     } else if #[cfg(windows)] {
+    } else if #[cfg(target_os = "macos")] {
+        pub use self::ac_adapter::AcAdapter;
     } else {
         compile_error!("Unsupported platform");
     }

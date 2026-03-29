@@ -130,7 +130,15 @@ cfg_if::cfg_if! {
     if #[cfg(target_os = "macos")] {
         pub use sys::macos;
         pub use macos::MemoryMappingBuilderUnix;
+        pub use macos::pipe;
     }
+}
+
+// macOS: read_raw_stdin — read from stdin without locking.
+#[cfg(target_os = "macos")]
+pub fn read_raw_stdin(out: &mut [u8]) -> std::io::Result<usize> {
+    use std::io::Read;
+    std::io::stdin().lock().read(out)
 }
 
 cfg_if::cfg_if! {

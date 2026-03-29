@@ -10,6 +10,8 @@ cfg_if::cfg_if! {
         pub(in crate::serial) mod windows;
         use windows as platform;
     } else if #[cfg(target_os = "macos")] {
+        pub(in crate::serial) mod macos;
+        use macos as platform;
     }
 }
 

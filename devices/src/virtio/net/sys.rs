@@ -10,6 +10,8 @@ cfg_if::cfg_if! {
         pub mod windows;
         use windows as platform;
     } else if #[cfg(target_os = "macos")] {
+        pub mod macos;
+        use macos as platform;
     }
 }
 
@@ -28,6 +30,8 @@ impl PendingBuffer {
             length: 0,
         }
     } else if #[cfg(target_os = "macos")] {
+        pub mod macos;
+        use macos as platform;
     }
 }
 
