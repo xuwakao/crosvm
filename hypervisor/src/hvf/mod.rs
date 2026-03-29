@@ -5,6 +5,8 @@
 // ARM64 / Apple Silicon only.
 
 pub mod ffi;
+#[cfg(test)]
+mod tests;
 pub mod vcpu;
 pub mod vm;
 
