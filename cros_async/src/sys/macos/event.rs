@@ -1,7 +1,8 @@
-// Copyright 2026 The Aetheria Authors
-// SPDX-License-Identifier: BSD-3-Clause
+// macOS EventAsync — pipe-backed event for async notification.
 //
-// macOS EventAsync implementation using kqueue executor.
+// On macOS, Event is backed by a pipe (not eventfd). signal() writes 1 byte,
+// so next_val() reads 1 byte and returns a count of 1. This differs from
+// Linux where eventfd provides an 8-byte counter.
 
 use base::Event;
 
@@ -16,19 +17,22 @@ impl EventAsync {
             .map(|io_source| EventAsync { io_source })
     }
 
-    /// Gets the next value from the eventfd.
+    /// Gets the next value from the event.
+    /// On macOS (pipe-backed), reads 1 byte and returns 1.
+    /// On Linux (eventfd), reads 8 bytes and returns the counter value.
     pub async fn next_val(&self) -> AsyncResult<u64> {
-        let (n, v) = self
+        // Read 1 byte — pipe signal.
+        let (n, _v) = self
             .io_source
-            .read_to_vec(None, 0u64.to_ne_bytes().to_vec())
+            .read_to_vec(None, vec![0u8; 1])
             .await?;
-        if n != 8 {
+        if n == 0 {
             return Err(AsyncError::EventAsync(base::Error::new(libc::ENODATA)));
         }
-        Ok(u64::from_ne_bytes(v.try_into().unwrap()))
+        Ok(1)
     }
 
-    /// Gets the next value from the eventfd and resets the count.
+    /// Gets the next value from the event and resets.
     pub async fn next_val_reset(&self) -> AsyncResult<u64> {
         self.next_val().await
     }
