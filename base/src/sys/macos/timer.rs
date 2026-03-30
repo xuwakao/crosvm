@@ -89,14 +89,38 @@ impl Timer {
     }
 
     /// Get the kqueue fd for this timer (for control operations).
+    ///
+    /// If the timer was created via `try_clone()`, its handle is a dup'd fd
+    /// that won't be in TIMER_MAP. In that case, register the dup'd fd by
+    /// looking up the original via fstat inode matching.
     fn kqueue_fd(&self) -> Result<RawFd> {
         let pipe_fd = self.handle.as_raw_descriptor();
-        TIMER_MAP
-            .lock()
-            .unwrap()
-            .get(&pipe_fd)
-            .map(|&(kq, _)| kq)
-            .ok_or(Error::new(libc::ENOENT))
+        let mut map = TIMER_MAP.lock().unwrap();
+
+        if let Some(&(kq, _)) = map.get(&pipe_fd) {
+            return Ok(kq);
+        }
+
+        // Handle dup'd fd from try_clone: find the original entry by checking
+        // if our fd points to the same pipe (same dev+ino via fstat).
+        let mut our_stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(pipe_fd, &mut our_stat) } != 0 {
+            return errno_result();
+        }
+
+        for (&orig_fd, &(kq, pipe_write)) in map.iter() {
+            let mut orig_stat: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(orig_fd, &mut orig_stat) } == 0
+                && orig_stat.st_dev == our_stat.st_dev
+                && orig_stat.st_ino == our_stat.st_ino
+            {
+                // Found the original — register our dup'd fd too.
+                map.insert(pipe_fd, (kq, pipe_write));
+                return Ok(kq);
+            }
+        }
+
+        Err(Error::new(libc::ENOENT))
     }
 }
 

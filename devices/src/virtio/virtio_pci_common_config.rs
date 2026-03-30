@@ -79,6 +79,14 @@ impl VirtioPciCommonConfig {
         queues: &mut [QueueConfig],
         device: &mut dyn VirtioDevice,
     ) {
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static RAW_COUNT: AtomicU32 = AtomicU32::new(0);
+            let c = RAW_COUNT.fetch_add(1, Ordering::Relaxed);
+            if c < 15 {
+                eprintln!("[common-cfg-raw] write offset={:#x} len={} data={:02x?} (#{c})", offset, data.len(), &data[..std::cmp::min(data.len(), 8)]);
+            }
+        }
         match data.len() {
             1 => self.write_common_config_byte(offset, data[0]),
             2 => self.write_common_config_word(
@@ -184,6 +192,14 @@ impl VirtioPciCommonConfig {
             };
         }
 
+        {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static WR_COUNT: AtomicU32 = AtomicU32::new(0);
+            let c = WR_COUNT.fetch_add(1, Ordering::Relaxed);
+            if c < 30 {
+                eprintln!("[common-cfg-dword] write offset={:#x} value={:#x} (#{c})", offset, value);
+            }
+        }
         match offset {
             0x00 => self.device_feature_select = value,
             0x08 => self.driver_feature_select = value,
