@@ -318,22 +318,27 @@ impl Vcpu for HvfVcpu {
             }
             ffi::HV_EXIT_REASON_CANCELED => Ok(VcpuExit::Intr),
             ffi::HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                // Virtual timer fired. On HVF, the vtimer IRQ is delivered
-                // natively — we just need to NOT mask it. The kernel's GIC
-                // driver handles acknowledgment via ICC system registers
-                // which HVF manages internally.
+                // Virtual timer fired. With HVF native GIC (macOS 15+),
+                // the vtimer→PPI routing is handled by hardware. We just
+                // unmask the timer so the IRQ is delivered to the vCPU.
+                // The kernel acknowledges via ICC system registers managed
+                // by HVF's GIC.
                 //
-                // Note: we do NOT call hv_vcpu_set_vtimer_mask(false) here
-                // because that would cause an infinite loop — the timer keeps
-                // firing immediately. Instead we leave it masked and inject
-                // the IRQ. The kernel will unmask it via ICC_EOIR1 write.
-                unsafe {
-                    ffi::hv_vcpu_set_pending_interrupt(
-                        self.vcpu,
-                        ffi::HV_INTERRUPT_TYPE_IRQ,
-                        true,
-                    );
-                };
+                // Without native GIC (macOS 14), we use hv_vcpu_set_pending_interrupt
+                // as a fallback, but this won't work for proper timer scheduling.
+                if ffi::hvf_gic_is_available() {
+                    // Native GIC: just unmask, HVF handles PPI delivery.
+                    unsafe { ffi::hv_vcpu_set_vtimer_mask(self.vcpu, false) };
+                } else {
+                    // Fallback: inject physical IRQ.
+                    unsafe {
+                        ffi::hv_vcpu_set_pending_interrupt(
+                            self.vcpu,
+                            ffi::HV_INTERRUPT_TYPE_IRQ,
+                            true,
+                        );
+                    };
+                }
                 Ok(VcpuExit::Intr)
             }
             _ => {

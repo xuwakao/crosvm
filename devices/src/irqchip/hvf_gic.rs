@@ -174,12 +174,13 @@ impl IrqChip for HvfGicChip {
                 // macOS 15+: Use native HVF GIC to inject SPI.
                 // SPI INTIDs start at 32; GSI 0 = SPI 32 in GIC terms.
                 let intid = gsi + 32;
+                // Edge-triggered: assert then deassert to create a rising edge.
                 let ret = unsafe { ffi::hv_gic_set_spi(intid, true) };
                 if ret != ffi::HV_SUCCESS {
-                    base::error!("hv_gic_set_spi({}) failed: {}", intid, ret);
-                } else {
-                    base::info!("hv_gic_set_spi({}) OK", intid);
+                    base::error!("hv_gic_set_spi({}, true) failed: {}", intid, ret);
                 }
+                // Deassert immediately so next event creates a new edge.
+                unsafe { ffi::hv_gic_set_spi(intid, false) };
             } else {
                 // macOS <15: Fallback — inject physical IRQ signal to all vCPUs.
                 let handles = self.vcpu_handles.lock();
