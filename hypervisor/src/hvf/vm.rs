@@ -141,7 +141,13 @@ impl HvfVm {
                     base::error!("hv_gic_create failed: {} (HV_BAD_ARGUMENT={})", ret, ffi::HV_BAD_ARGUMENT);
                 } else {
                     base::info!("HVF native GIC created successfully");
+                }
+                // Release the config object (OS_OBJECT type, ref-counted).
+                // SAFETY: config is a valid os_object returned by hv_gic_config_create.
+                extern "C" { fn os_release(object: *mut std::ffi::c_void); }
+                unsafe { os_release(config) };
 
+                if ret == ffi::HV_SUCCESS {
                     // Enable the GIC distributor: write GICD_CTLR (offset 0x0000)
                     // with EnableGrp1NS (bit 1) = 1. This allows Group 1 Non-Secure
                     // interrupts to be forwarded to the CPU interface.

@@ -176,7 +176,13 @@ impl TcpSocket {
 
 impl UnixSeqpacket {
     /// Creates a pair of connected sockets.
-    /// macOS does not support SOCK_SEQPACKET, so we use SOCK_STREAM instead.
+    ///
+    /// macOS does not support `SOCK_SEQPACKET` for `AF_UNIX` sockets —
+    /// `socketpair(AF_UNIX, SOCK_SEQPACKET, 0)` returns `EPROTONOSUPPORT`.
+    /// We use `SOCK_STREAM` instead, which is functionally equivalent for
+    /// crosvm's Tube communication because Tube uses length-prefixed serde
+    /// serialization that preserves message boundaries at the application layer.
+    ///
     /// Both returned file descriptors have the `CLOEXEC` flag set.
     pub fn pair() -> io::Result<(UnixSeqpacket, UnixSeqpacket)> {
         let (fd0, fd1) = socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0)?;
