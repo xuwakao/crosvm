@@ -234,6 +234,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         // Create virtio devices from config and wrap in VirtioPciDevice for PCI bus.
         let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
         let mut ioevent_host_tubes: Vec<Tube> = Vec::new();
+        let mut msi_host_tubes: Vec<Tube> = Vec::new();
 
         // Block devices: Config.disks → DiskOption.open() → BlockAsync → VirtioPciDevice.
         for disk in &cfg.disks {
@@ -259,7 +260,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             // MSI-X tube: interrupt configuration between device and IRQ chip.
             let (msi_host_tube, msi_device_tube) =
                 Tube::pair().context("failed to create MSI tube")?;
-            ioevent_host_tubes.push(msi_host_tube);
+            msi_host_tubes.push(msi_host_tube);
             // Ioevent tube: VirtioPciDevice uses this to register ioevents.
             // On macOS, kqueue fds cannot be sent via SCM_RIGHTS (sendmsg
             // returns EINVAL), so ioevent registration via tube will fail.
@@ -280,7 +281,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 msi_device_tube,
                 false, // disable_virtio_intx
                 None,  // shared_memory_vm_memory_client — not needed for block
-                VmMemoryClient::new(ioevent_device_tube),
+                VmMemoryClient::new_noop_ioevent(ioevent_device_tube),
                 vm_device_tube,
             )
             .context("failed to create virtio-pci block device")?;
@@ -355,25 +356,23 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         irq_chip.finalize_devices(&mut sys_allocator, &linux.io_bus, &linux.mmio_bus)?;
         irq_chip.finalize()?;
 
-        // Spawn VM control handler thread to process ioevent and MSI requests
-        // from virtio devices. Must be after finalize_devices so sys_allocator
-        // is done with its setup phase.
-        let vm_for_control = linux.vm.try_clone()
-            .context("failed to clone VM for control handler")?;
-        let irq_chip_for_control = irq_chip.try_box_clone()
-            .context("failed to clone irq chip for control handler")?;
-        let vm_control_join = if !ioevent_host_tubes.is_empty() {
+        // Keep ioevent host tubes alive (noop_ioevent mode — write_bar fallback).
+        let _ioevent_tubes_keepalive = ioevent_host_tubes;
+
+        // Spawn MSI handler thread — processes VmIrqRequest from VirtioPciDevice's
+        // MsixConfig to allocate MSI-X interrupt vectors. Without this, the device
+        // cannot deliver completion interrupts and the kernel hangs waiting for I/O.
+        let mut irq_chip_for_msi = irq_chip.try_box_clone()
+            .context("failed to clone irq chip for MSI handler")?;
+        // Use first MSI tube (single disk). For multi-disk, would need per-device handlers.
+        let msi_tube = msi_host_tubes.into_iter().next();
+        let msi_handler_join = if let Some(tube) = msi_tube {
             Some(thread::Builder::new()
-                .name("vm_control".into())
+                .name("msi_handler".into())
                 .spawn(move || {
-                    vm_control_handler_thread(
-                        vm_for_control,
-                        irq_chip_for_control,
-                        sys_allocator,
-                        ioevent_host_tubes,
-                    );
+                    msi_handler_thread(irq_chip_for_msi, sys_allocator, tube);
                 })
-                .context("failed to spawn vm_control handler thread")?)
+                .context("failed to spawn MSI handler thread")?)
         } else {
             None
         };
@@ -484,10 +483,9 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         }
         // VM memory handler thread exits when all device-side tubes are dropped
         // (which happens when the vCPU loop exits and devices are cleaned up).
-        if let Some(join) = vm_control_join {
-            if let Err(e) = join.join() {
-                error!("vm_control handler thread panicked: {:?}", e);
-            }
+        drop(_ioevent_tubes_keepalive);
+        if let Some(join) = msi_handler_join {
+            let _ = join.join();
         }
 
         Ok(exit_state)
@@ -499,130 +497,72 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
     }
 }
 
-/// VM control handler — processes ioevent and MSI requests from virtio devices.
+/// MSI handler thread — processes VmIrqRequest from VirtioPciDevice's MsixConfig.
 ///
-/// Handles VmMemoryRequest (ioevent registration) and VmIrqRequest (MSI-X
-/// interrupt allocation) on tubes from VirtioPciDevice. Each tube carries one
-/// message type. Tubes are ordered: [ioevent0, msi0, ioevent1, msi1, ...].
+/// When the guest driver enables MSI-X vectors, MsixConfig sends AllocateOneMsi
+/// requests through the MSI tube. This handler allocates IRQ numbers from the
+/// system allocator and registers the irqfd with the IRQ chip, enabling the
+/// device to deliver completion interrupts to the GIC.
 #[cfg(target_arch = "aarch64")]
-fn vm_control_handler_thread(
-    mut vm: impl Vm + 'static,
-    irq_chip: Box<dyn devices::IrqChipAArch64>,
+fn msi_handler_thread(
+    mut irq_chip: Box<dyn devices::IrqChipAArch64>,
     mut sys_allocator: SystemAllocator,
-    tubes: Vec<Tube>,
+    tube: Tube,
 ) {
-    use hypervisor::IoEventAddress;
+    use devices::IrqChip;
+    use devices::IrqEdgeEvent;
+    use devices::IrqEventSource;
     use vm_control::IrqSetup;
     use vm_control::VmIrqRequest;
-    use vm_control::VmIrqResponse;
-    use vm_control::VmMemoryRequest;
-    use vm_control::VmMemoryResponse;
-    use devices::IrqChip;
 
-    info!("vm_control handler started: {} tube(s)", tubes.len());
+    info!("MSI handler thread started");
 
-    // Each disk creates 2 tubes: [ioevent, msi].
-    // Process them with per-tube threads.
-    let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::new();
-    for (idx, tube) in tubes.into_iter().enumerate() {
-        let is_ioevent = idx % 2 == 0;
-        if is_ioevent {
-            let mut vm_clone = vm.try_clone().expect("VM clone");
-            handles.push(std::thread::Builder::new()
-                .name(format!("vm_ctrl_{}", idx))
-                .spawn(move || {
-                    loop {
-                        match tube.recv::<VmMemoryRequest>() {
-                            Ok(request) => {
-                                let response = match request {
-                                    VmMemoryRequest::IoEventRaw(req) => {
-                                        let res = if req.register {
-                                            vm_clone.register_ioevent(
-                                                &req.event,
-                                                IoEventAddress::Mmio(req.addr),
-                                                req.datamatch,
-                                            )
-                                        } else {
-                                            vm_clone.unregister_ioevent(
-                                                &req.event,
-                                                IoEventAddress::Mmio(req.addr),
-                                                req.datamatch,
-                                            )
-                                        };
-                                        match res {
-                                            Ok(_) => VmMemoryResponse::Ok,
-                                            Err(e) => VmMemoryResponse::Err(
-                                                anyhow::Error::new(e).into(),
-                                            ),
-                                        }
-                                    }
-                                    _ => VmMemoryResponse::Ok,
-                                };
-                                if tube.send(&response).is_err() { break; }
-                            }
-                            Err(_) => break,
+    loop {
+        match tube.recv::<VmIrqRequest>() {
+            Ok(request) => {
+                let response = request.execute(
+                    |setup| match setup {
+                        IrqSetup::Event(irq_num, irqfd, device_id, queue_id, device_name) => {
+                            let edge_evt = IrqEdgeEvent::from_event(
+                                irqfd.try_clone().map_err(|_| base::Error::new(libc::EIO))?,
+                            );
+                            let source = IrqEventSource {
+                                device_id,
+                                queue_id,
+                                device_name,
+                            };
+                            irq_chip.as_irq_chip_mut().register_edge_irq_event(
+                                irq_num, &edge_evt, source,
+                            )?;
+                            info!("MSI: allocated IRQ {} for device", irq_num);
+                            Ok(())
                         }
-                    }
-                })
-                .expect("spawn ioevent handler"));
-        } else {
-            let mut irq_chip_clone = irq_chip.try_box_clone().expect("IRQ chip clone");
-            handles.push(std::thread::Builder::new()
-                .name(format!("vm_ctrl_{}", idx))
-                .spawn(move || {
-                    use devices::IrqEdgeEvent;
-                    use devices::IrqEventSource;
-                    loop {
-                        match tube.recv::<VmIrqRequest>() {
-                            Ok(request) => {
-                                let response = request.execute(
-                                    |setup| {
-                                        match setup {
-                                            IrqSetup::Event(irq_num, irqfd, device_id, queue_id, device_name) => {
-                                                let edge_evt = IrqEdgeEvent::from_event(
-                                                    irqfd.try_clone().map_err(|e| base::Error::new(libc::EIO))?,
-                                                );
-                                                let source = IrqEventSource {
-                                                    device_id,
-                                                    queue_id,
-                                                    device_name,
-                                                };
-                                                irq_chip_clone.as_irq_chip_mut().register_edge_irq_event(
-                                                    irq_num, &edge_evt, source,
-                                                )?;
-                                                Ok(())
-                                            }
-                                            IrqSetup::Route(_) => Ok(()),
-                                            IrqSetup::UnRegister(irq_num, irqfd) => {
-                                                let edge_evt = IrqEdgeEvent::from_event(
-                                                    irqfd.try_clone().map_err(|e| base::Error::new(libc::EIO))?,
-                                                );
-                                                irq_chip_clone.as_irq_chip_mut().unregister_edge_irq_event(
-                                                    irq_num, &edge_evt,
-                                                )?;
-                                                Ok(())
-                                            }
-                                        }
-                                    },
-                                    &mut sys_allocator,
-                                );
-                                if tube.send(&response).is_err() { break; }
-                            }
-                            Err(_) => break,
+                        IrqSetup::Route(_) => Ok(()),
+                        IrqSetup::UnRegister(irq_num, irqfd) => {
+                            let edge_evt = IrqEdgeEvent::from_event(
+                                irqfd.try_clone().map_err(|_| base::Error::new(libc::EIO))?,
+                            );
+                            irq_chip
+                                .as_irq_chip_mut()
+                                .unregister_edge_irq_event(irq_num, &edge_evt)?;
+                            Ok(())
                         }
-                    }
-                })
-                .expect("spawn MSI handler"));
-            // sys_allocator was moved — only one MSI handler for single-disk VMs.
-            break;
+                    },
+                    &mut sys_allocator,
+                );
+                if let Err(e) = tube.send(&response) {
+                    error!("MSI handler: send response failed: {}", e);
+                    break;
+                }
+            }
+            Err(e) => {
+                error!("MSI handler: tube recv failed: {}", e);
+                break;
+            }
         }
     }
 
-    for h in handles {
-        let _ = h.join();
-    }
-
-    info!("vm_control handler exiting");
+    info!("MSI handler thread exiting");
 }
 
 /// IRQ handler thread — polls device IRQ eventfds and routes interrupts.
