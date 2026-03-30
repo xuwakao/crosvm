@@ -159,6 +159,30 @@ impl HvfVm {
                     } else {
                         base::info!("GIC distributor EnableGrp1NS set");
                     }
+
+                    // Configure ALL SPIs as edge-triggered via GICD_ICFGRn.
+                    // GICD_ICFGR2+ covers SPIs (INTID 32+). Each register covers
+                    // 16 interrupts, 2 bits each. Bit 1 of each field: 1=edge, 0=level.
+                    // Setting all to edge-triggered (0xAAAAAAAA) ensures that
+                    // hv_gic_set_spi assert+deassert reliably creates a pending
+                    // interrupt regardless of timing — no level-triggered state
+                    // machine issues.
+                    // Configure ICFGRs for all SPIs we might use.
+                    // The actual SPI count is queried during GIC config (typically 988),
+                    // but we only need to configure the first few dozen for our devices.
+                    let spi_count: u32 = 64; // covers GSIs 0-63, sufficient for all devices
+                    let icfgr_count = (spi_count + 15) / 16;
+                    for i in 0..icfgr_count {
+                        let offset: u16 = 0x0C08 + (i as u16) * 4; // GICD_ICFGR2+
+                        let val: u64 = 0xAAAAAAAA; // all edge-triggered
+                        let r = unsafe { ffi::hv_gic_set_distributor_reg(offset, val) };
+                        if r != ffi::HV_SUCCESS {
+                            base::warn!("GICD_ICFGR[{}] (offset {:#x}) write failed: {}", i + 2, offset, r);
+                        } else if i == 0 {
+                            base::info!("GICD_ICFGR[2] (offset {:#x}) = {:#x} — first SPI config written OK", offset, val);
+                        }
+                    }
+                    base::info!("GIC: configured {} SPIs as edge-triggered", spi_count);
                 }
             }
         } else {

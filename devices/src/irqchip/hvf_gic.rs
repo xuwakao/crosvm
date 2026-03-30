@@ -185,19 +185,16 @@ impl IrqChip for HvfGicChip {
             // the guest transparently. hv_vcpu_cancel forces the exit so that
             // inject_interrupts runs and additional pending state is processed.
             use hypervisor::hvf::ffi;
-            if hypervisor::hvf::ffi::hvf_gic_is_available() {
-                use hypervisor::hvf::ffi;
+            if ffi::hvf_gic_is_available() {
+                // All SPIs configured as edge-triggered in GICD_ICFGR during init.
+                // Assert then deassert: the GIC latches the pending state on the
+                // rising edge. No timing issues — edge-triggered SPIs don't need
+                // to stay asserted. Each assert+deassert creates exactly one
+                // pending interrupt.
                 let intid = gsi + ffi::GIC_SPI_BASE;
-                // Deassert any previously asserted SPI for this GSI first,
-                // creating a clean edge for the new assertion.
-                let mut asserted = self.asserted_spis.lock();
-                if (gsi as usize) < asserted.len() && asserted[gsi as usize] {
-                    unsafe { ffi::hv_gic_set_spi(intid, false) };
-                }
-                // Assert the SPI. Track that it's asserted.
-                unsafe { ffi::hv_gic_set_spi(intid, true) };
-                if (gsi as usize) < asserted.len() {
-                    asserted[gsi as usize] = true;
+                unsafe {
+                    ffi::hv_gic_set_spi(intid, true);
+                    ffi::hv_gic_set_spi(intid, false);
                 }
             } else {
                 // macOS <15: Fallback — inject physical IRQ signal to all vCPUs.
@@ -249,18 +246,6 @@ impl IrqChip for HvfGicChip {
             // Clear all pending after injection.
             for p in pending.iter_mut() {
                 *p = false;
-            }
-            // Deassert any previously asserted SPIs. The guest has had at
-            // least one hv_vcpu_run iteration to process the interrupt.
-            if ffi::hvf_gic_is_available() {
-                let mut asserted = self.asserted_spis.lock();
-                for (i, a) in asserted.iter_mut().enumerate() {
-                    if *a {
-                        let intid = i as u32 + ffi::GIC_SPI_BASE;
-                        unsafe { ffi::hv_gic_set_spi(intid, false) };
-                        *a = false;
-                    }
-                }
             }
         } else {
             // Deassert IRQ line if nothing pending.

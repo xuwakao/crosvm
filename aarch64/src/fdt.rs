@@ -496,6 +496,12 @@ fn create_pci_nodes(
         // CONTROLLER_DATA(3)
         interrupts.push(GIC_FDT_IRQ_TYPE_SPI);
         interrupts.push(*irq_num);
+        // On macOS HVF, all SPIs are configured as edge-triggered in GICD_ICFGR
+        // to avoid level-triggered timing issues with hv_gic_set_spi. The FDT
+        // must match the GIC configuration.
+        #[cfg(target_os = "macos")]
+        interrupts.push(IRQ_TYPE_EDGE_RISING);
+        #[cfg(not(target_os = "macos"))]
         interrupts.push(IRQ_TYPE_LEVEL_HIGH);
     }
 
