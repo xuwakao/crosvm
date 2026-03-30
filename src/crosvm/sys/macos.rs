@@ -262,7 +262,39 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         )
         .context("Arch::build_vm failed")?;
 
-        info!("VM built successfully. Starting vCPU execution...");
+        info!("VM built successfully. Registering GIC MMIO devices...");
+
+        // Register GIC distributor and redistributor on the MMIO bus.
+        // These provide the MMIO register interface that the kernel probes
+        // to detect and initialize the GICv3 interrupt controller.
+        {
+            use devices::GicDistributor;
+            use devices::GicRedistributor;
+
+            // GIC Distributor at 0x3FFF0000, 64KB
+            const GIC_DIST_BASE: u64 = 0x3FFF0000;
+            const GIC_DIST_SIZE: u64 = 0x10000;
+            let gicd = GicDistributor::new(64); // 64 IRQs (32 SPI + 32 PPI/SGI)
+            linux.mmio_bus.insert(
+                Arc::new(Mutex::new(gicd)),
+                GIC_DIST_BASE,
+                GIC_DIST_SIZE,
+            ).expect("failed to register GIC distributor");
+
+            // GIC Redistributor at 0x3FFD0000, 128KB per vCPU
+            const GIC_REDIST_BASE: u64 = 0x3FFD0000;
+            const GIC_REDIST_SIZE_PER_CPU: u64 = 0x20000; // 128KB (64KB RD + 64KB SGI)
+            for cpu_id in 0..vcpu_count {
+                let gicr = GicRedistributor::new(cpu_id as u32, vcpu_count as u32);
+                let base = GIC_REDIST_BASE + (cpu_id as u64) * GIC_REDIST_SIZE_PER_CPU;
+                linux.mmio_bus.insert(
+                    Arc::new(Mutex::new(gicr)),
+                    base,
+                    GIC_REDIST_SIZE_PER_CPU,
+                ).expect("failed to register GIC redistributor");
+            }
+            info!("GIC MMIO devices registered: GICD@{:#x} GICR@{:#x}", GIC_DIST_BASE, GIC_REDIST_BASE);
+        }
 
         // Finalize IRQ chip after all devices registered.
         use devices::IrqChip;

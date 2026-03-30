@@ -33,6 +33,9 @@ pub struct HvfVcpu {
     /// Shared copy of vcpu handle for cross-thread cancellation.
     /// hv_vcpu_cancel is safe to call from any thread.
     vcpu_for_cancel: Arc<VcpuCancelHandle>,
+    /// Pending IRQ number for GIC ICC_IAR1_EL1 acknowledgment.
+    /// Set when vtimer fires, cleared when ICC_IAR1_EL1 is read.
+    pending_irq: std::cell::Cell<Option<u32>>,
 }
 
 /// Thread-safe handle for cancelling a vCPU from another thread.
@@ -75,6 +78,7 @@ impl HvfVcpu {
             exit_info,
             immediate_exit: Arc::new(AtomicBool::new(false)),
             vcpu_for_cancel: Arc::new(VcpuCancelHandle(vcpu)),
+            pending_irq: std::cell::Cell::new(None),
         })
     }
 
@@ -148,24 +152,29 @@ impl HvfVcpu {
             return val;
         }
 
-        // GIC ICC system registers (Op0=3, Op1=0, CRn=12)
-        // ICC_SRE_EL1: Op0=3, Op1=0, CRn=12, CRm=12, Op2=5 => enable system register interface
-        let icc_sre_el1 = ffi::sysreg_encode(3, 0, 12, 12, 5);
-        // ICC_CTLR_EL1: Op0=3, Op1=0, CRn=12, CRm=12, Op2=4
-        let icc_ctlr_el1 = ffi::sysreg_encode(3, 0, 12, 12, 4);
-        // ICC_PMR_EL1: Op0=3, Op1=0, CRn=4, CRm=6, Op2=0
-        let icc_pmr_el1 = ffi::sysreg_encode(3, 0, 4, 6, 0);
-        // ICC_IAR1_EL1: Op0=3, Op1=0, CRn=12, CRm=12, Op2=0 (interrupt acknowledge)
-        let icc_iar1_el1 = ffi::sysreg_encode(3, 0, 12, 12, 0);
-        // ICC_IGRPEN1_EL1: Op0=3, Op1=0, CRn=12, CRm=12, Op2=7
-        let icc_igrpen1_el1 = ffi::sysreg_encode(3, 0, 12, 12, 7);
+        // GIC ICC system registers
+        let icc_sre_el1 = ffi::sysreg_encode(3, 0, 12, 12, 5);     // ICC_SRE_EL1
+        let icc_ctlr_el1 = ffi::sysreg_encode(3, 0, 12, 12, 4);    // ICC_CTLR_EL1
+        let icc_pmr_el1 = ffi::sysreg_encode(3, 0, 4, 6, 0);       // ICC_PMR_EL1
+        let icc_iar1_el1 = ffi::sysreg_encode(3, 0, 12, 12, 0);    // ICC_IAR1_EL1 (ack)
+        let icc_eoir1_el1 = ffi::sysreg_encode(3, 0, 12, 12, 1);   // ICC_EOIR1_EL1 (eoi)
+        let icc_igrpen1_el1 = ffi::sysreg_encode(3, 0, 12, 12, 7); // ICC_IGRPEN1_EL1
+        let icc_bpr1_el1 = ffi::sysreg_encode(3, 0, 12, 12, 3);    // ICC_BPR1_EL1
 
         match reg_id {
             x if x == icc_sre_el1 => 0x7,    // SRE=1, DFB=1, DIB=1 (system registers enabled)
             x if x == icc_ctlr_el1 => 0x0,   // Default control
             x if x == icc_pmr_el1 => 0xff,    // All priorities enabled
-            x if x == icc_iar1_el1 => 1023,   // Spurious interrupt (no pending IRQ)
+            x if x == icc_iar1_el1 => {
+                // Acknowledge: return pending IRQ number, or 1023 (spurious)
+                match self.pending_irq.take() {
+                    Some(irq) => irq as u64,
+                    None => 1023,
+                }
+            }
+            x if x == icc_eoir1_el1 => 0,   // EOI read returns 0
             x if x == icc_igrpen1_el1 => 0x1, // Group 1 enabled
+            x if x == icc_bpr1_el1 => 0,      // Binary point = 0
             _ => 0,                            // Unknown register — return 0
         }
     }
@@ -304,8 +313,17 @@ impl Vcpu for HvfVcpu {
             }
             ffi::HV_EXIT_REASON_CANCELED => Ok(VcpuExit::Intr),
             ffi::HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                // Virtual timer fired — unmask and deliver as interrupt.
-                unsafe { ffi::hv_vcpu_set_vtimer_mask(self.vcpu, false) };
+                // Virtual timer fired — unmask, set pending, and inject IRQ.
+                // PPI 27 is the standard virtual timer interrupt on ARM64.
+                self.pending_irq.set(Some(27));
+                unsafe {
+                    ffi::hv_vcpu_set_vtimer_mask(self.vcpu, false);
+                    ffi::hv_vcpu_set_pending_interrupt(
+                        self.vcpu,
+                        ffi::HV_INTERRUPT_TYPE_IRQ,
+                        true,
+                    );
+                };
                 Ok(VcpuExit::Intr)
             }
             _ => {

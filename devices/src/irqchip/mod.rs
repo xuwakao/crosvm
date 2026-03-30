@@ -89,6 +89,11 @@ mod hvf_gic;
 #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub use self::hvf_gic::HvfGicChip;
 
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub mod hvf_gic_mmio;
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+pub use self::hvf_gic_mmio::{GicDistributor, GicRedistributor};
+
 pub type IrqEventIndex = usize;
 
 #[cfg(target_arch = "x86_64")]
