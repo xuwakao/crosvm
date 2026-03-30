@@ -46,6 +46,9 @@ pub struct HvfGicChip {
     // Track which IRQs are pending (one bool per GSI).
     // When a device signals an event, the corresponding IRQ becomes pending.
     pending_irqs: Arc<Mutex<Vec<bool>>>,
+    // HVF vCPU handles for cross-thread interrupt injection.
+    // Set by the vCPU thread via set_vcpu_handle().
+    vcpu_handles: Arc<Mutex<Vec<u64>>>,
 }
 
 // Number of SPI (Shared Peripheral Interrupts).
@@ -57,7 +60,18 @@ impl HvfGicChip {
             num_vcpus,
             irq_events: Vec::new(),
             pending_irqs: Arc::new(Mutex::new(vec![false; MAX_IRQS])),
+            vcpu_handles: Arc::new(Mutex::new(Vec::new())),
         })
+    }
+
+    /// Register a vCPU handle for cross-thread interrupt injection.
+    /// Called from the vCPU thread after creating the HVF vCPU.
+    pub fn set_vcpu_handle(&self, vcpu_id: usize, handle: u64) {
+        let mut handles = self.vcpu_handles.lock();
+        if handles.len() <= vcpu_id {
+            handles.resize(vcpu_id + 1, 0);
+        }
+        handles[vcpu_id] = handle;
     }
 }
 
@@ -147,6 +161,22 @@ impl IrqChip for HvfGicChip {
             if (gsi as usize) < pending.len() {
                 pending[gsi as usize] = true;
             }
+            drop(pending);
+
+            // Inject IRQ immediately to all vCPUs via HVF.
+            // This wakes vCPUs from WFI and delivers the interrupt.
+            let handles = self.vcpu_handles.lock();
+            for &handle in handles.iter() {
+                if handle != 0 {
+                    unsafe {
+                        hypervisor::hvf::ffi::hv_vcpu_set_pending_interrupt(
+                            handle,
+                            hypervisor::hvf::ffi::HV_INTERRUPT_TYPE_IRQ,
+                            true,
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -227,6 +257,7 @@ impl IrqChip for HvfGicChip {
             num_vcpus: self.num_vcpus,
             irq_events: Vec::new(), // Events are not cloned — only the main instance handles events
             pending_irqs: Arc::clone(&self.pending_irqs),
+            vcpu_handles: Arc::clone(&self.vcpu_handles),
         })
     }
 

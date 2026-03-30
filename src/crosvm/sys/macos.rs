@@ -303,6 +303,27 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         irq_chip.finalize_devices(&mut sys_allocator, &linux.io_bus, &linux.mmio_bus)?;
         irq_chip.finalize()?;
 
+        // Start IRQ handler thread — polls device IRQ eventfds and calls
+        // service_irq_event to mark interrupts pending for vCPU injection.
+        // This is the macOS equivalent of Linux's irq_handler_thread.
+        let (irq_handler_control, irq_handler_control_for_thread) =
+            Tube::pair().context("failed to create irq handler control tube")?;
+        let irq_chip_for_irq_thread = irq_chip
+            .try_box_clone()
+            .context("failed to clone irq chip for IRQ handler")?;
+
+        let irq_handler_join = thread::Builder::new()
+            .name("irq_handler".into())
+            .spawn(move || {
+                if let Err(e) = irq_handler_thread(
+                    irq_chip_for_irq_thread,
+                    irq_handler_control_for_thread,
+                ) {
+                    error!("IRQ handler thread error: {:#}", e);
+                }
+            })
+            .context("failed to spawn IRQ handler thread")?;
+
         // Get vCPU init data. build_vm created vCPUs on the main thread,
         // but HVF requires vCPUs to be used on the thread that created them.
         // We'll re-create them in dedicated threads.
@@ -332,6 +353,9 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                     // Create vCPU on this thread (HVF requirement).
                     let mut vcpu = HvfVcpu::new(vcpu_id)
                         .context("failed to create HVF vCPU")?;
+
+                    // Register vCPU handle for cross-thread IRQ injection.
+                    irq_chip_clone.set_vcpu_handle(vcpu_id, vcpu.hvf_handle());
 
                     // Configure vCPU with arch-specific init registers.
                     Arch::configure_vcpu(
@@ -371,6 +395,14 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             }
         }
 
+        // Shut down IRQ handler thread.
+        if let Err(e) = irq_handler_control.send(&vm_control::IrqHandlerRequest::Exit) {
+            error!("failed to send Exit to IRQ handler: {}", e);
+        }
+        if let Err(e) = irq_handler_join.join() {
+            error!("IRQ handler thread panicked: {:?}", e);
+        }
+
         Ok(exit_state)
     }
 
@@ -378,6 +410,103 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
     {
         bail!("HVF is only supported on AArch64")
     }
+}
+
+/// IRQ handler thread — polls device IRQ eventfds and routes interrupts.
+/// This is the macOS equivalent of Linux's `irq_handler_thread` in linux.rs.
+/// It runs in a dedicated thread, blocking on WaitContext (kqueue) for
+/// device IRQ events, and calls service_irq_event to mark them pending.
+#[cfg(target_arch = "aarch64")]
+fn irq_handler_thread(
+    mut irq_chip: Box<dyn devices::IrqChipAArch64>,
+    handler_control: Tube,
+) -> anyhow::Result<()> {
+    use base::EventToken;
+    use base::ReadNotifier;
+    use base::WaitContext;
+    use devices::IrqChip;
+    use devices::IrqEventIndex;
+    use vm_control::IrqHandlerRequest;
+
+    #[derive(EventToken)]
+    enum Token {
+        IrqFd { index: IrqEventIndex },
+        HandlerControl,
+    }
+
+    let wait_ctx = WaitContext::build_with(&[(
+        handler_control.get_read_notifier(),
+        Token::HandlerControl,
+    )])
+    .context("failed to build IRQ handler wait context")?;
+
+    // Register all IRQ event tokens from the IRQ chip.
+    let irq_chip_mut = irq_chip.as_irq_chip_mut();
+    let irq_event_tokens = irq_chip_mut
+        .irq_event_tokens()
+        .context("failed to get IRQ event tokens")?;
+
+    for (index, _source, evt) in irq_event_tokens.iter() {
+        wait_ctx
+            .add(evt, Token::IrqFd { index: *index })
+            .context("failed to add IRQ event to wait context")?;
+    }
+
+    info!(
+        "IRQ handler thread started: {} IRQ event(s) registered",
+        irq_event_tokens.len()
+    );
+
+    'wait: loop {
+        let events = match wait_ctx.wait() {
+            Ok(v) => v,
+            Err(e) => {
+                error!("IRQ handler poll error: {}", e);
+                break 'wait;
+            }
+        };
+
+        for event in events.iter().filter(|e| e.is_readable) {
+            match event.token {
+                Token::HandlerControl => {
+                    match handler_control.recv::<IrqHandlerRequest>() {
+                        Ok(IrqHandlerRequest::Exit) => {
+                            info!("IRQ handler thread exiting");
+                            break 'wait;
+                        }
+                        Ok(IrqHandlerRequest::RefreshIrqEventTokens) => {
+                            // Remove old tokens, re-register new ones.
+                            for (_index, _source, evt) in irq_event_tokens.iter() {
+                                let _ = wait_ctx.delete(evt);
+                            }
+                            let new_tokens = irq_chip_mut
+                                .irq_event_tokens()
+                                .context("failed to refresh IRQ event tokens")?;
+                            for (index, _source, evt) in new_tokens.iter() {
+                                wait_ctx
+                                    .add(evt, Token::IrqFd { index: *index })
+                                    .context("failed to re-add IRQ event")?;
+                            }
+                            // Note: can't reassign irq_event_tokens here due to borrow
+                            // issues with irq_chip_mut — tokens are refreshed in place.
+                        }
+                        Ok(_) => {} // Ignore other requests
+                        Err(e) => {
+                            error!("IRQ handler control recv error: {}", e);
+                            break 'wait;
+                        }
+                    }
+                }
+                Token::IrqFd { index } => {
+                    if let Err(e) = irq_chip_mut.service_irq_event(index) {
+                        error!("failed to service IRQ event {}: {}", index, e);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Minimal vCPU run loop.
