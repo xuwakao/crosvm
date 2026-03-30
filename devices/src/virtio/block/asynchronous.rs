@@ -265,6 +265,7 @@ async fn process_one_request(
         }
     };
 
+    eprintln!("[blk] status={} available_bytes={}", status, available_bytes);
     status_writer
         .write_all(&[status])
         .map_err(ExecuteError::WriteStatus)?;
@@ -279,12 +280,13 @@ async fn process_one_chain(
     flush_timer: &RefCell<TimerAsync<Timer>>,
     flush_timer_armed: &RefCell<bool>,
 ) {
+    eprintln!("[blk-chain] reader={} writer={}", avail_desc.reader.available_bytes(), avail_desc.writer.available_bytes());
     let len = match process_one_request(&mut avail_desc, disk_state, flush_timer, flush_timer_armed)
         .await
     {
         Ok(len) => len,
         Err(e) => {
-            error!("block: failed to handle request: {:#}", e);
+            eprintln!("[blk-chain] FAILED: {:#}", e);
             0
         }
     };
@@ -818,6 +820,7 @@ impl BlockAsync {
                     })?;
             }
             VIRTIO_BLK_T_OUT => {
+                eprintln!("[blk-write] sector={} reader_avail={} writer_avail={}", sector, reader.available_bytes(), writer.available_bytes());
                 let data_len = reader.available_bytes();
                 if data_len == 0 {
                     return Ok(());
@@ -827,10 +830,14 @@ impl BlockAsync {
                     .ok_or(ExecuteError::OutOfRange)?;
                 check_range(offset, data_len as u64, disk_size)?;
                 let disk_image = &disk_state.disk_image;
-                reader
+                let write_result = reader
                     .read_exact_to_at_fut(&**disk_image, data_len, offset)
-                    .await
-                    .map_err(|desc_error| ExecuteError::WriteIo {
+                    .await;
+                match &write_result {
+                    Ok(()) => eprintln!("[blk-write] OK: {} bytes at offset {}", data_len, offset),
+                    Err(e) => eprintln!("[blk-write] FAILED: {}", e),
+                }
+                write_result.map_err(|desc_error| ExecuteError::WriteIo {
                         length: data_len,
                         sector,
                         desc_error,

@@ -188,7 +188,12 @@ impl Interrupt {
         Interrupt {
             inner: Arc::new(InterruptInner {
                 interrupt_status: AtomicUsize::new(0),
-                async_intr_status: false,
+                // On macOS HVF, interrupts are injected asynchronously from the
+                // IRQ handler thread via hv_gic_set_spi. The guest may not have
+                // read+cleared the ISR register before the next completion fires.
+                // Setting async_intr_status=true ensures every trigger_interrupt()
+                // fires the INTx, even if the previous status is still set.
+                async_intr_status: cfg!(target_os = "macos"),
                 transport: Transport::Pci {
                     pci: TransportPci {
                         irq_evt_lvl,
