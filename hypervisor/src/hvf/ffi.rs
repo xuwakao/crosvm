@@ -461,6 +461,28 @@ pub unsafe fn hv_gic_set_spi(intid: u32, level: bool) -> hv_return_t {
     match func { Some(f) => f(intid, level), None => -1 }
 }
 
+/// Write a GIC distributor register.
+pub unsafe fn hv_gic_set_distributor_reg(reg: u16, value: u64) -> hv_return_t {
+    type Fn = unsafe extern "C" fn(u16, u64) -> hv_return_t;
+    static FUNC: std::sync::OnceLock<Option<Fn>> = std::sync::OnceLock::new();
+    let func = FUNC.get_or_init(|| {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_set_distributor_reg\0".as_ptr() as *const _);
+        if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+    });
+    match func { Some(f) => f(reg, value), None => -1 }
+}
+
+/// Read a GIC distributor register.
+pub unsafe fn hv_gic_get_distributor_reg(reg: u16, value: *mut u64) -> hv_return_t {
+    type Fn = unsafe extern "C" fn(u16, *mut u64) -> hv_return_t;
+    static FUNC: std::sync::OnceLock<Option<Fn>> = std::sync::OnceLock::new();
+    let func = FUNC.get_or_init(|| {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_get_distributor_reg\0".as_ptr() as *const _);
+        if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+    });
+    match func { Some(f) => f(reg, value), None => -1 }
+}
+
 /// Reset GIC device.
 pub unsafe fn hv_gic_reset() -> hv_return_t {
     type Fn = unsafe extern "C" fn() -> hv_return_t;

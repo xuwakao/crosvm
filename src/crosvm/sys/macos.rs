@@ -322,109 +322,54 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             })
             .context("failed to spawn IRQ handler thread")?;
 
-        // Get vCPU init data. build_vm created vCPUs on the main thread,
-        // but HVF requires vCPUs to be used on the thread that created them.
-        // We'll re-create them in dedicated threads.
-        let vcpu_init_data = linux.vcpu_init.clone();
-        let vm_for_vcpus = linux.vm.try_clone().context("failed to clone vm")?;
+        // Use the vCPUs created by build_vm directly on the main thread.
+        // HVF requires vCPUs to be used from the thread that created them,
+        // and the native GIC binds redistributors to these vCPUs.
+        // For single-vCPU VMs, we run the vCPU loop on the main thread.
+        let mut vcpus = linux.vcpus.take().context("no vcpus created by build_vm")?;
 
-        // Keep the main-thread vCPUs alive — their GIC redistributor associations
-        // must persist until the thread vCPUs are created.
-        let main_thread_vcpus = linux.vcpus.take();
-
-        // Debug: check redistributor base for each vCPU
-        if let Some(ref vcpus) = main_thread_vcpus {
-            for vcpu in vcpus.iter() {
-                // Read MPIDR via HVF sys_reg API directly
-                let mut mpidr: u64 = 0;
-                let ret = unsafe {
-                    hypervisor::hvf::ffi::hv_vcpu_get_sys_reg(
-                        vcpu.hvf_handle(),
-                        hypervisor::hvf::ffi::HV_SYS_REG_MPIDR_EL1,
-                        &mut mpidr,
-                    )
-                };
-                info!("vCPU {} MPIDR={:#x} (ret={})", vcpu.id(), mpidr, ret);
-
-                // Query redistributor base via HVF
-                if hypervisor::hvf::ffi::hvf_gic_is_available() {
-                    type GetRedistBaseFn = unsafe extern "C" fn(u64, *mut u64) -> i32;
-                    let func: Option<GetRedistBaseFn> = unsafe {
-                        let sym = libc::dlsym(libc::RTLD_DEFAULT,
-                            b"hv_gic_get_redistributor_base\0".as_ptr() as *const _);
-                        if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
-                    };
-                    if let Some(f) = func {
-                        let mut redist_base: u64 = 0;
-                        let ret = unsafe { f(vcpu.hvf_handle(), &mut redist_base) };
-                        info!("  hv_gic_get_redistributor_base: ret={} base={:#x}", ret, redist_base);
-                    }
-                }
-            }
+        // Register vCPU handles for cross-thread IRQ injection.
+        for vcpu in vcpus.iter() {
+            irq_chip.set_vcpu_handle(vcpu.id(), vcpu.hvf_handle());
         }
-        let _main_thread_vcpus = main_thread_vcpus;
+
+        // Configure vCPUs with arch-specific init registers.
+        let vcpu_init_data = linux.vcpu_init.clone();
+        for (vcpu_id, vcpu) in vcpus.iter_mut().enumerate() {
+            Arch::configure_vcpu(
+                &linux.vm,
+                linux.vm.get_hypervisor(),
+                &mut irq_chip,
+                vcpu,
+                vcpu_init_data[vcpu_id].clone(),
+                vcpu_id,
+                vcpu_count,
+                None,
+            )
+            .context("failed to configure vcpu")?;
+        }
 
         let io_bus = linux.io_bus.clone();
         let mmio_bus = linux.mmio_bus.clone();
         let hypercall_bus = linux.hypercall_bus.clone();
 
-        let mut vcpu_handles = Vec::new();
-        for vcpu_id in 0..vcpu_count {
-            let io_bus = io_bus.clone();
-            let mmio_bus = mmio_bus.clone();
-            let hypercall_bus = hypercall_bus.clone();
-            let mut irq_chip_clone = IrqChip::try_clone(&irq_chip)
-                .context("failed to clone irq chip")?;
-            let init = vcpu_init_data[vcpu_id].clone();
-            let vm_thread = vm_for_vcpus.try_clone().context("failed to clone vm")?;
-
-            let handle = thread::Builder::new()
-                .name(format!("crosvm_vcpu{}", vcpu_id))
-                .spawn(move || -> Result<ExitState> {
-                    // Create vCPU on this thread (HVF requirement).
-                    let mut vcpu = HvfVcpu::new(vcpu_id)
-                        .context("failed to create HVF vCPU")?;
-
-                    // Register vCPU handle for cross-thread IRQ injection.
-                    irq_chip_clone.set_vcpu_handle(vcpu_id, vcpu.hvf_handle());
-
-                    // Configure vCPU with arch-specific init registers.
-                    Arch::configure_vcpu(
-                        &vm_thread,
-                        vm_thread.get_hypervisor(),
-                        &mut irq_chip_clone,
-                        &mut vcpu,
-                        init,
-                        vcpu_id,
-                        vcpu_count,
-                        None, // cpu_config
-                    )
-                    .context("failed to configure vcpu")?;
-
-                    vcpu_loop(&mut vcpu, &io_bus, &mmio_bus, &hypercall_bus, &irq_chip_clone)
-                })
-                .context("failed to spawn vcpu thread")?;
-            vcpu_handles.push(handle);
-        }
-
-        // Wait for all vCPU threads to finish.
-        let mut exit_state = ExitState::Stop;
-        for handle in vcpu_handles {
-            match handle.join() {
-                Ok(Ok(state)) => {
+        // Run the vCPU loop on the main thread (single vCPU).
+        // This ensures the vCPU runs on the same thread that created it,
+        // which is required by HVF and ensures GIC redistributor binding.
+        let exit_state = if let Some(vcpu) = vcpus.first_mut() {
+            match vcpu_loop(vcpu, &io_bus, &mmio_bus, &hypercall_bus, &irq_chip) {
+                Ok(state) => {
                     info!("vCPU exited with {:?}", state);
-                    exit_state = state;
+                    state
                 }
-                Ok(Err(e)) => {
-                    error!("vCPU thread error: {:#}", e);
-                    exit_state = ExitState::Crash;
-                }
-                Err(_) => {
-                    error!("vCPU thread panicked");
-                    exit_state = ExitState::Crash;
+                Err(e) => {
+                    error!("vCPU error: {:#}", e);
+                    ExitState::Crash
                 }
             }
-        }
+        } else {
+            ExitState::Stop
+        };
 
         // Shut down IRQ handler thread.
         if let Err(e) = irq_handler_control.send(&vm_control::IrqHandlerRequest::Exit) {

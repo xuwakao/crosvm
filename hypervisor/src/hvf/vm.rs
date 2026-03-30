@@ -139,6 +139,15 @@ impl HvfVm {
                     base::error!("hv_gic_create failed: {} (HV_BAD_ARGUMENT={})", ret, -85377021i32);
                 } else {
                     base::info!("HVF native GIC created successfully");
+
+                    // Enable the GIC distributor (Group1 NS enable).
+                    // GICD_CTLR offset 0x0, bit 1 = EnableGrp1NS
+                    let ret = unsafe { ffi::hv_gic_set_distributor_reg(0x0000, 0x2) };
+                    if ret != ffi::HV_SUCCESS {
+                        base::warn!("hv_gic_set_distributor_reg(CTLR, EnableGrp1NS) failed: {}", ret);
+                    } else {
+                        base::info!("GIC distributor EnableGrp1NS set");
+                    }
                 }
             }
         } else {
