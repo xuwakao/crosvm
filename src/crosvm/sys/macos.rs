@@ -268,6 +268,11 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             // construction, but the host side just needs to respond "Ok".
             let (ioevent_host_tube, ioevent_device_tube) =
                 Tube::pair().context("failed to create ioevent tube")?;
+            info!(
+                "ioevent tube pair: host_fd={}, device_fd={}",
+                base::AsRawDescriptor::as_raw_descriptor(&ioevent_host_tube),
+                base::AsRawDescriptor::as_raw_descriptor(&ioevent_device_tube),
+            );
             ioevent_host_tubes.push(ioevent_host_tube);
             // VM control tube: device-to-VMM control messages.
             let (_vm_host_tube, vm_device_tube) =
@@ -279,7 +284,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 msi_device_tube,
                 false, // disable_virtio_intx
                 None,  // shared_memory_vm_memory_client — not needed for block
-                VmMemoryClient::new_noop_ioevent(ioevent_device_tube),
+                VmMemoryClient::new(ioevent_device_tube),
                 vm_device_tube,
             )
             .context("failed to create virtio-pci block device")?;
@@ -290,6 +295,13 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
 
         let mut vcpu_ids: Vec<usize> = (0..vcpu_count).collect();
 
+        // Verify ioevent device tube is still open before build_vm.
+        if !ioevent_host_tubes.is_empty() {
+            let host_fd = base::AsRawDescriptor::as_raw_descriptor(&ioevent_host_tubes[0]);
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let fstat_ret = unsafe { libc::fstat(host_fd, &mut stat) };
+            info!("PRE build_vm: ioevent host fd={} fstat={}", host_fd, fstat_ret);
+        }
         info!("Building VM with Arch::build_vm...");
 
         // Build the VM — this creates serial devices, FDT, loads kernel, etc.
@@ -318,18 +330,27 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         .context("Arch::build_vm failed")?;
 
         info!("VM built successfully.");
+        // Verify ioevent host tube is still open after build_vm.
+        if !ioevent_host_tubes.is_empty() {
+            let host_fd = base::AsRawDescriptor::as_raw_descriptor(&ioevent_host_tubes[0]);
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            let fstat_ret = unsafe { libc::fstat(host_fd, &mut stat) };
+            info!("POST build_vm: ioevent host fd={} fstat={}", host_fd, fstat_ret);
+        }
 
-        // Spawn VM memory handler thread to auto-respond to ioevent registration
-        // requests from virtio devices. On macOS, kqueue fds can't be sent via
-        // SCM_RIGHTS so the device's IoEventRaw requests will fail at the sendmsg
-        // level. The handler thread intercepts requests and responds Ok — actual
-        // ioevent signaling is done via vm.handle_io_events() in the MMIO write
-        // path (the HAXM/WHPX approach).
+        // Spawn VM memory handler thread to process ioevent registration
+        // requests from virtio devices. The device sends IoEventRaw requests
+        // through the tube, and this thread registers them on the VM via
+        // vm.register_ioevent(). Events are pipe-backed (not kqueue), so
+        // they can be sent via SCM_RIGHTS and registered with the VM.
+        // The MMIO write path calls vm.handle_io_events() to signal them.
+        let vm_for_memory = linux.vm.try_clone()
+            .context("failed to clone VM for memory handler")?;
         let vm_memory_join = if !ioevent_host_tubes.is_empty() {
             Some(thread::Builder::new()
                 .name("vm_memory".into())
                 .spawn(move || {
-                    vm_memory_auto_responder(ioevent_host_tubes);
+                    vm_memory_handler_thread(vm_for_memory, ioevent_host_tubes);
                 })
                 .context("failed to spawn vm_memory handler thread")?)
         } else {
@@ -492,21 +513,24 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
     }
 }
 
-/// Auto-responder for virtio device VmMemory requests.
+/// VM memory handler thread — processes ioevent registration from virtio devices.
 ///
-/// On macOS, kqueue-based Event fds cannot be sent via SCM_RIGHTS (sendmsg
-/// returns EINVAL). VirtioPciDevice tries to send IoEventRaw requests containing
-/// Event fds through the ioevent tube, which will fail at the sendmsg level.
+/// Virtio devices send IoEventRaw requests through tubes to register ioevents
+/// with the VM. This thread receives those requests and calls vm.register_ioevent()
+/// directly. The MMIO write path in vcpu_loop calls vm.handle_io_events() on
+/// every write, which signals the registered Events to wake device workers.
 ///
-/// This thread reads from the host side of ioevent tubes and responds Ok to all
-/// requests. Since ioevent registration can't work through tubes on macOS, actual
-/// ioevent signaling is handled by calling vm.handle_io_events() on every MMIO
-/// write in the vCPU loop — the same approach used by HAXM and WHPX backends.
+/// Events are pipe-backed on macOS (not kqueue), so they can be serialized
+/// through tubes via SCM_RIGHTS.
 #[cfg(target_arch = "aarch64")]
-fn vm_memory_auto_responder(tubes: Vec<Tube>) {
+fn vm_memory_handler_thread(
+    mut vm: impl Vm + 'static,
+    tubes: Vec<Tube>,
+) {
     use base::EventToken;
     use base::ReadNotifier;
     use base::WaitContext;
+    use hypervisor::IoEventAddress;
     use vm_control::VmMemoryRequest;
     use vm_control::VmMemoryResponse;
 
@@ -530,47 +554,70 @@ fn vm_memory_auto_responder(tubes: Vec<Tube>) {
         }
     }
 
-    info!("vm_memory auto-responder started: {} tube(s)", tubes.len());
+    info!(
+        "vm_memory handler started: {} tube(s), fd={}",
+        tubes.len(),
+        base::AsRawDescriptor::as_raw_descriptor(&tubes[0]),
+    );
 
-    loop {
-        let events = match wait_ctx.wait() {
-            Ok(v) => v,
-            Err(e) => {
-                debug!("vm_memory: wait returned: {}", e);
-                break;
-            }
-        };
-
-        if events.is_empty() {
-            break;
-        }
-
-        let mut any_readable = false;
-        for event in events.iter().filter(|e| e.is_readable) {
-            any_readable = true;
-            if let Token::Tube(idx) = event.token {
-                match tubes[idx].recv::<VmMemoryRequest>() {
-                    Ok(_request) => {
-                        // Respond Ok to all requests. Ioevent registration is handled
-                        // via vm.handle_io_events() in the MMIO write path instead.
-                        if let Err(e) = tubes[idx].send(&VmMemoryResponse::Ok) {
-                            debug!("vm_memory: failed to send response: {}", e);
+    // Simple blocking recv loop for single tube.
+    if tubes.len() == 1 {
+        let tube = &tubes[0];
+        // Check if fd 13 (device side) is still open from this thread
+        let mut s: libc::stat = unsafe { std::mem::zeroed() };
+        let f13 = unsafe { libc::fstat(13, &mut s) };
+        info!("vm_memory: fd 13 fstat from handler thread: {}", f13);
+        info!("vm_memory: waiting for first request...");
+        loop {
+            match tube.recv::<VmMemoryRequest>() {
+                Ok(request) => {
+                    let response = match request {
+                        VmMemoryRequest::IoEventRaw(req) => {
+                            info!(
+                                "vm_memory: ioevent {} at {:#x}",
+                                if req.register { "register" } else { "unregister" },
+                                req.addr,
+                            );
+                            let res = if req.register {
+                                vm.register_ioevent(
+                                    &req.event,
+                                    IoEventAddress::Mmio(req.addr),
+                                    req.datamatch,
+                                )
+                            } else {
+                                vm.unregister_ioevent(
+                                    &req.event,
+                                    IoEventAddress::Mmio(req.addr),
+                                    req.datamatch,
+                                )
+                            };
+                            match res {
+                                Ok(_) => VmMemoryResponse::Ok,
+                                Err(e) => {
+                                    error!("vm_memory: ioevent failed: {}", e);
+                                    VmMemoryResponse::Err(anyhow::Error::new(e).into())
+                                }
+                            }
                         }
+                        _ => {
+                            debug!("vm_memory: unhandled request, responding Ok");
+                            VmMemoryResponse::Ok
+                        }
+                    };
+                    if let Err(e) = tube.send(&response) {
+                        error!("vm_memory: send response failed: {}", e);
+                        break;
                     }
-                    Err(e) => {
-                        debug!("vm_memory: tube {} closed: {}", idx, e);
-                        let _ = wait_ctx.delete(tubes[idx].get_read_notifier());
-                    }
+                }
+                Err(e) => {
+                    error!("vm_memory: tube recv error: {}", e);
+                    break;
                 }
             }
         }
-
-        if !any_readable {
-            break;
-        }
     }
 
-    info!("vm_memory auto-responder exiting");
+    info!("vm_memory handler exiting");
 }
 
 /// IRQ handler thread — polls device IRQ eventfds and routes interrupts.
