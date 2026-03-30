@@ -152,8 +152,17 @@ fn create_gic_node(fdt: &mut Fdt, is_gicv3: bool, has_vgic_its: bool, num_cpus: 
     let intc_node = fdt.root_mut().subnode_mut("intc")?;
     if is_gicv3 {
         intc_node.set_prop("compatible", "arm,gic-v3")?;
-        gic_reg_prop[2] = AARCH64_GIC_DIST_BASE - (AARCH64_GIC_REDIST_SIZE * num_cpus);
-        gic_reg_prop[3] = AARCH64_GIC_REDIST_SIZE * num_cpus;
+        // On macOS, AARCH64_GIC_REDIST_SIZE is the full region (not per-CPU).
+        #[cfg(target_os = "macos")]
+        {
+            gic_reg_prop[2] = AARCH64_GIC_DIST_BASE - AARCH64_GIC_REDIST_SIZE;
+            gic_reg_prop[3] = AARCH64_GIC_REDIST_SIZE;
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            gic_reg_prop[2] = AARCH64_GIC_DIST_BASE - (AARCH64_GIC_REDIST_SIZE * num_cpus);
+            gic_reg_prop[3] = AARCH64_GIC_REDIST_SIZE * num_cpus;
+        }
     } else {
         intc_node.set_prop("compatible", "arm,cortex-a15-gic")?;
         gic_reg_prop[2] = AARCH64_GIC_CPUI_BASE;

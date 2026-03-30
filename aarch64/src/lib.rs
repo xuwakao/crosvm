@@ -127,7 +127,12 @@ const AARCH64_PVTIME_SIZE: u64 = 64;
 // address space.
 const AARCH64_GIC_DIST_BASE: u64 = 0x40000000 - AARCH64_GIC_DIST_SIZE;
 const AARCH64_GIC_CPUI_BASE: u64 = AARCH64_GIC_DIST_BASE - AARCH64_GIC_CPUI_SIZE;
-const AARCH64_GIC_REDIST_SIZE: u64 = 0x20000;
+// On macOS with HVF native GIC, the redistributor region is 32MB (0x2000000)
+// regardless of vCPU count. On Linux/KVM, it's 0x20000 per vCPU.
+#[cfg(target_os = "macos")]
+const AARCH64_GIC_REDIST_SIZE: u64 = 0x2000000; // 32MB total region
+#[cfg(not(target_os = "macos"))]
+const AARCH64_GIC_REDIST_SIZE: u64 = 0x20000;   // 128KB per vCPU
 const AARCH64_GIC_ITS_BASE: u64 = 0x40000000;
 const AARCH64_GIC_ITS_SIZE: u64 = 0x20000;
 

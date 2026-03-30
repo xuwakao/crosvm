@@ -156,24 +156,36 @@ impl IrqChip for HvfGicChip {
             let gsi = irq_event.gsi;
             // Clear the event (edge-triggered: auto-deassert).
             let _ = irq_event.trigger_event.wait();
-            // Mark IRQ as pending for injection.
+
+            // Mark IRQ as pending.
             let mut pending = self.pending_irqs.lock();
             if (gsi as usize) < pending.len() {
                 pending[gsi as usize] = true;
             }
             drop(pending);
 
-            // Inject IRQ immediately to all vCPUs via HVF.
-            // This wakes vCPUs from WFI and delivers the interrupt.
-            let handles = self.vcpu_handles.lock();
-            for &handle in handles.iter() {
-                if handle != 0 {
-                    unsafe {
-                        hypervisor::hvf::ffi::hv_vcpu_set_pending_interrupt(
-                            handle,
-                            hypervisor::hvf::ffi::HV_INTERRUPT_TYPE_IRQ,
-                            true,
-                        );
+            // Inject interrupt via the best available mechanism.
+            use hypervisor::hvf::ffi;
+            if ffi::hvf_gic_is_available() {
+                // macOS 15+: Use native HVF GIC to inject SPI.
+                // SPI INTIDs start at 32; GSI 0 = SPI 32 in GIC terms.
+                let intid = gsi + 32;
+                let ret = unsafe { ffi::hv_gic_set_spi(intid, true) };
+                if ret != ffi::HV_SUCCESS {
+                    base::error!("hv_gic_set_spi({}) failed: {}", intid, ret);
+                }
+            } else {
+                // macOS <15: Fallback — inject physical IRQ signal to all vCPUs.
+                let handles = self.vcpu_handles.lock();
+                for &handle in handles.iter() {
+                    if handle != 0 {
+                        unsafe {
+                            ffi::hv_vcpu_set_pending_interrupt(
+                                handle,
+                                ffi::HV_INTERRUPT_TYPE_IRQ,
+                                true,
+                            );
+                        }
                     }
                 }
             }

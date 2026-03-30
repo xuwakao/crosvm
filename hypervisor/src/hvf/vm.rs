@@ -66,6 +66,85 @@ impl HvfVm {
             }
         }
 
+        // Create HVF native GIC if available (macOS 15+).
+        // Must be done after hv_vm_create but before hv_vcpu_create.
+        if ffi::hvf_gic_is_available() {
+            // Query required alignment
+            type AlignFn = unsafe extern "C" fn(*mut usize) -> ffi::hv_return_t;
+            let get_dist_align: Option<AlignFn> = unsafe {
+                let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_get_distributor_base_alignment\0".as_ptr() as *const _);
+                if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+            };
+            let get_redist_align: Option<AlignFn> = unsafe {
+                let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_get_redistributor_base_alignment\0".as_ptr() as *const _);
+                if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+            };
+
+            let mut dist_align: usize = 0x10000;
+            let mut redist_align: usize = 0x10000;
+            if let Some(f) = get_dist_align {
+                unsafe { f(&mut dist_align) };
+            }
+            if let Some(f) = get_redist_align {
+                unsafe { f(&mut redist_align) };
+            }
+            // Also query redistributor sizes
+            let mut redist_region_size: usize = 0;
+            let mut redist_per_cpu_size: usize = 0;
+            let mut spi_base: u32 = 0;
+            let mut spi_count: u32 = 0;
+            unsafe {
+                let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_get_redistributor_region_size\0".as_ptr() as *const _);
+                if !sym.is_null() {
+                    let f: unsafe extern "C" fn(*mut usize) -> ffi::hv_return_t = std::mem::transmute(sym);
+                    f(&mut redist_region_size);
+                }
+                let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_get_redistributor_size\0".as_ptr() as *const _);
+                if !sym.is_null() {
+                    let f: unsafe extern "C" fn(*mut usize) -> ffi::hv_return_t = std::mem::transmute(sym);
+                    f(&mut redist_per_cpu_size);
+                }
+                let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_get_spi_interrupt_range\0".as_ptr() as *const _);
+                if !sym.is_null() {
+                    let f: unsafe extern "C" fn(*mut u32, *mut u32) -> ffi::hv_return_t = std::mem::transmute(sym);
+                    f(&mut spi_base, &mut spi_count);
+                }
+            }
+            base::info!(
+                "HVF GIC params: dist_align={:#x} redist_align={:#x} redist_region={:#x} redist_per_cpu={:#x} spi_base={} spi_count={}",
+                dist_align, redist_align, redist_region_size, redist_per_cpu_size, spi_base, spi_count
+            );
+
+            // Place GIC regions to avoid overlap.
+            // Redistributor needs redist_region_size (32MB typically).
+            // Put GICD at the top, GICR below with enough space.
+            let gic_dist_base: u64 = 0x3FFF0000u64 & !(dist_align as u64 - 1);
+            let gic_redist_base: u64 = (gic_dist_base - redist_region_size as u64) & !(redist_align as u64 - 1);
+            base::info!("HVF GIC: GICD@{:#x} GICR@{:#x}", gic_dist_base, gic_redist_base);
+
+            let config = unsafe { ffi::hv_gic_config_create() };
+            if config.is_null() {
+                base::error!("hv_gic_config_create returned null");
+            } else {
+                let ret = unsafe { ffi::hv_gic_config_set_distributor_base(config, gic_dist_base) };
+                if ret != ffi::HV_SUCCESS {
+                    base::error!("hv_gic_config_set_distributor_base({:#x}) failed: {}", gic_dist_base, ret);
+                }
+                let ret = unsafe { ffi::hv_gic_config_set_redistributor_base(config, gic_redist_base) };
+                if ret != ffi::HV_SUCCESS {
+                    base::error!("hv_gic_config_set_redistributor_base({:#x}) failed: {}", gic_redist_base, ret);
+                }
+                let ret = unsafe { ffi::hv_gic_create(config) };
+                if ret != ffi::HV_SUCCESS {
+                    base::error!("hv_gic_create failed: {} (HV_BAD_ARGUMENT={})", ret, -85377021i32);
+                } else {
+                    base::info!("HVF native GIC created successfully");
+                }
+            }
+        } else {
+            base::info!("HVF native GIC not available (macOS <15), using MMIO emulation");
+        }
+
         Ok(HvfVm {
             hvf,
             guest_mem,

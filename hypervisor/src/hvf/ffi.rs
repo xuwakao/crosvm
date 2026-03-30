@@ -362,6 +362,117 @@ pub unsafe fn hv_vcpu_cancel(vcpu: hv_vcpu_t) -> hv_return_t {
 }
 
 // ============================================================================
+// GIC API (macOS 15.0+, runtime detected)
+// ============================================================================
+
+/// GIC config object (opaque pointer).
+pub type hv_gic_config_t = *mut c_void;
+
+/// IPA type for guest physical addresses.
+pub type hv_ipa_t = u64;
+
+/// Check if native HVF GIC API is available (macOS 15+).
+pub fn hvf_gic_is_available() -> bool {
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| unsafe {
+        !libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_create\0".as_ptr() as *const _).is_null()
+    })
+}
+
+macro_rules! dlsym_fn {
+    ($name:ident, $sym:expr, $ty:ty, $default:expr) => {
+        pub unsafe fn $name(args: impl FnOnce($ty) -> hv_return_t) -> hv_return_t {
+            static FUNC: std::sync::OnceLock<Option<$ty>> = std::sync::OnceLock::new();
+            let func = FUNC.get_or_init(|| {
+                let sym = libc::dlsym(libc::RTLD_DEFAULT, $sym.as_ptr() as *const _);
+                if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+            });
+            match func {
+                Some(f) => args(*f),
+                None => $default,
+            }
+        }
+    };
+}
+
+/// Create GIC config object. Returns null on macOS <15.
+/// This is an OS_OBJECT type — must be released with dispatch_release/os_release.
+pub unsafe fn hv_gic_config_create() -> hv_gic_config_t {
+    // Use weak linking: this symbol only exists on macOS 15+
+    type Fn = unsafe extern "C" fn() -> hv_gic_config_t;
+    static FUNC: std::sync::OnceLock<Option<Fn>> = std::sync::OnceLock::new();
+    let func = FUNC.get_or_init(|| {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_config_create\0".as_ptr() as *const _);
+        if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+    });
+    match func {
+        Some(f) => {
+            let obj = f();
+            if !obj.is_null() {
+                base::info!("hv_gic_config_create returned {:p}", obj);
+            }
+            obj
+        }
+        None => std::ptr::null_mut(),
+    }
+}
+
+/// Set GIC distributor base address.
+pub unsafe fn hv_gic_config_set_distributor_base(config: hv_gic_config_t, addr: hv_ipa_t) -> hv_return_t {
+    type Fn = unsafe extern "C" fn(hv_gic_config_t, hv_ipa_t) -> hv_return_t;
+    static FUNC: std::sync::OnceLock<Option<Fn>> = std::sync::OnceLock::new();
+    let func = FUNC.get_or_init(|| {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_config_set_distributor_base\0".as_ptr() as *const _);
+        if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+    });
+    match func { Some(f) => f(config, addr), None => -1 }
+}
+
+/// Set GIC redistributor base address.
+pub unsafe fn hv_gic_config_set_redistributor_base(config: hv_gic_config_t, addr: hv_ipa_t) -> hv_return_t {
+    type Fn = unsafe extern "C" fn(hv_gic_config_t, hv_ipa_t) -> hv_return_t;
+    static FUNC: std::sync::OnceLock<Option<Fn>> = std::sync::OnceLock::new();
+    let func = FUNC.get_or_init(|| {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_config_set_redistributor_base\0".as_ptr() as *const _);
+        if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+    });
+    match func { Some(f) => f(config, addr), None => -1 }
+}
+
+/// Create GIC device.
+pub unsafe fn hv_gic_create(config: hv_gic_config_t) -> hv_return_t {
+    type Fn = unsafe extern "C" fn(hv_gic_config_t) -> hv_return_t;
+    static FUNC: std::sync::OnceLock<Option<Fn>> = std::sync::OnceLock::new();
+    let func = FUNC.get_or_init(|| {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_create\0".as_ptr() as *const _);
+        if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+    });
+    match func { Some(f) => f(config), None => -1 }
+}
+
+/// Inject SPI interrupt. Thread-safe.
+pub unsafe fn hv_gic_set_spi(intid: u32, level: bool) -> hv_return_t {
+    type Fn = unsafe extern "C" fn(u32, bool) -> hv_return_t;
+    static FUNC: std::sync::OnceLock<Option<Fn>> = std::sync::OnceLock::new();
+    let func = FUNC.get_or_init(|| {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_set_spi\0".as_ptr() as *const _);
+        if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+    });
+    match func { Some(f) => f(intid, level), None => -1 }
+}
+
+/// Reset GIC device.
+pub unsafe fn hv_gic_reset() -> hv_return_t {
+    type Fn = unsafe extern "C" fn() -> hv_return_t;
+    static FUNC: std::sync::OnceLock<Option<Fn>> = std::sync::OnceLock::new();
+    let func = FUNC.get_or_init(|| {
+        let sym = libc::dlsym(libc::RTLD_DEFAULT, b"hv_gic_reset\0".as_ptr() as *const _);
+        if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+    });
+    match func { Some(f) => f(), None => -1 }
+}
+
+// ============================================================================
 // Safe wrapper helpers
 // ============================================================================
 
