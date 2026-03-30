@@ -128,6 +128,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
             params.push("earlycon=uart8250,mmio32,0x3f8".to_string());
             params.push("panic=30".to_string());
             params.push("keep_bootcon".to_string());
+            params.push("rdinit=/init".to_string());
             params
         },
         acpi_sdts: Vec::new(),

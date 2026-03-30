@@ -48,6 +48,7 @@ pub struct GicDistributor {
     ctlr: u32,
     num_irqs: u32,
     enabled_irqs: [u32; 2], // 64 IRQs in 2 x 32-bit words
+    icfgr: [u32; 4],        // Interrupt config (edge/level) for 64 IRQs
 }
 
 impl GicDistributor {
@@ -56,6 +57,7 @@ impl GicDistributor {
             ctlr: 0,
             num_irqs,
             enabled_irqs: [0; 2],
+            icfgr: [0; 4],
         }
     }
 }
@@ -93,8 +95,9 @@ impl BusDevice for GicDistributor {
             o if o >= GICD_IPRIORITYR_BASE && o < GICD_IPRIORITYR_BASE + 256 => {
                 0 // All priorities at 0 (highest)
             }
-            o if o >= GICD_ICFGR_BASE && o < GICD_ICFGR_BASE + 32 => {
-                0 // All level-triggered
+            o if o >= GICD_ICFGR_BASE && o < GICD_ICFGR_BASE + 16 => {
+                let idx = ((o - GICD_ICFGR_BASE) / 4) as usize;
+                if idx < self.icfgr.len() { self.icfgr[idx] } else { 0 }
             }
             _ => 0,
         };
@@ -127,6 +130,12 @@ impl BusDevice for GicDistributor {
                 let idx = ((o - GICD_ICENABLER_BASE) / 4) as usize;
                 if idx < self.enabled_irqs.len() {
                     self.enabled_irqs[idx] &= !val; // Clear enable bits
+                }
+            }
+            o if o >= GICD_ICFGR_BASE && o < GICD_ICFGR_BASE + 16 => {
+                let idx = ((o - GICD_ICFGR_BASE) / 4) as usize;
+                if idx < self.icfgr.len() {
+                    self.icfgr[idx] = val;
                 }
             }
             _ => {} // Ignore other writes
