@@ -175,11 +175,11 @@ impl TcpSocket {
 }
 
 impl UnixSeqpacket {
-    /// Creates a pair of connected `SOCK_SEQPACKET` sockets.
-    ///
+    /// Creates a pair of connected sockets.
+    /// macOS does not support SOCK_SEQPACKET, so we use SOCK_STREAM instead.
     /// Both returned file descriptors have the `CLOEXEC` flag set.
     pub fn pair() -> io::Result<(UnixSeqpacket, UnixSeqpacket)> {
-        let (fd0, fd1) = socketpair(libc::AF_UNIX, libc::SOCK_SEQPACKET, 0)?;
+        let (fd0, fd1) = socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0)?;
         let (s0, s1) = (UnixSeqpacket::from(fd0), UnixSeqpacket::from(fd1));
         Ok((cloexec_or_close(s0)?, cloexec_or_close(s1)?))
     }

@@ -301,9 +301,28 @@ extern "C" {
     // --- Debug ---
     pub fn hv_vcpu_set_trap_debug_exceptions(vcpu: hv_vcpu_t, enable: bool) -> hv_return_t;
 
-    // --- Cancellation ---
-    /// Force the vCPU to exit from hv_vcpu_run. Safe to call from any thread.
-    pub fn hv_vcpu_cancel(vcpu: hv_vcpu_t) -> hv_return_t;
+}
+
+/// Force the vCPU to exit from hv_vcpu_run. Safe to call from any thread.
+/// This API is only available on macOS 15+. On older versions, returns HV_SUCCESS (no-op).
+pub unsafe fn hv_vcpu_cancel(vcpu: hv_vcpu_t) -> hv_return_t {
+    type HvVcpuCancelFn = unsafe extern "C" fn(hv_vcpu_t) -> hv_return_t;
+    static FUNC: std::sync::OnceLock<Option<HvVcpuCancelFn>> = std::sync::OnceLock::new();
+    let func = FUNC.get_or_init(|| {
+        let sym = libc::dlsym(
+            libc::RTLD_DEFAULT,
+            b"hv_vcpu_cancel\0".as_ptr() as *const _,
+        );
+        if sym.is_null() {
+            None
+        } else {
+            Some(std::mem::transmute::<*mut libc::c_void, HvVcpuCancelFn>(sym))
+        }
+    });
+    match func {
+        Some(f) => f(vcpu),
+        None => HV_SUCCESS, // No-op on older macOS
+    }
 }
 
 // ============================================================================
