@@ -43,9 +43,29 @@ pub struct HvfVm {
 }
 
 impl HvfVm {
-    /// Create a new HVF VM. The VM is already created by `Hvf::new()` (hv_vm_create).
-    /// This just wraps the guest memory and tracking structures.
+    /// Create a new HVF VM and map all guest memory regions.
+    /// The VM is already created by `Hvf::new()` (hv_vm_create).
     pub fn new(hvf: Hvf, guest_mem: GuestMemory) -> Result<Self> {
+        let flags = ffi::HV_MEMORY_READ | ffi::HV_MEMORY_WRITE | ffi::HV_MEMORY_EXEC;
+
+        // Map all guest memory regions into the HVF VM.
+        for region in guest_mem.regions() {
+            let host_addr = region.host_addr as *const std::ffi::c_void;
+            let guest_addr = region.guest_addr.0;
+            let size = region.size;
+
+            base::info!(
+                "HvfVm::new mapping guest memory: guest={:#x} size={:#x} host={:p}",
+                guest_addr, size, host_addr
+            );
+
+            let ret = unsafe { ffi::hv_vm_map(host_addr, guest_addr, size, flags) };
+            if ret != ffi::HV_SUCCESS {
+                base::error!("hv_vm_map failed for guest={:#x}: ret={}", guest_addr, ret);
+                return Err(base::Error::new(ret));
+            }
+        }
+
         Ok(HvfVm {
             hvf,
             guest_mem,
@@ -118,8 +138,16 @@ impl Vm for HvfVm {
         }
         flags |= ffi::HV_MEMORY_EXEC;
 
+        base::info!(
+            "HvfVm::add_memory_region: guest={:#x} size={:#x} host={:p} flags={:#x}",
+            guest_addr.0, size, host_addr, flags
+        );
+
         // SAFETY: host_addr points to a valid mapped region of `size` bytes.
         let ret = unsafe { ffi::hv_vm_map(host_addr, guest_addr.0, size, flags) };
+        if ret != ffi::HV_SUCCESS {
+            base::error!("hv_vm_map failed: ret={}", ret);
+        }
         hvf_result(ret)?;
 
         let mut slot_lock = self.next_mem_slot.lock();

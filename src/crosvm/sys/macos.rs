@@ -271,11 +271,13 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
 
         let io_bus = linux.io_bus.clone();
         let mmio_bus = linux.mmio_bus.clone();
+        let hypercall_bus = linux.hypercall_bus.clone();
 
         let mut vcpu_handles = Vec::new();
         for vcpu_id in 0..vcpu_count {
             let io_bus = io_bus.clone();
             let mmio_bus = mmio_bus.clone();
+            let hypercall_bus = hypercall_bus.clone();
             let mut irq_chip_clone = IrqChip::try_clone(&irq_chip)
                 .context("failed to clone irq chip")?;
             let init = vcpu_init_data[vcpu_id].clone();
@@ -301,7 +303,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                     )
                     .context("failed to configure vcpu")?;
 
-                    vcpu_loop(&mut vcpu, &io_bus, &mmio_bus, &irq_chip_clone)
+                    vcpu_loop(&mut vcpu, &io_bus, &mmio_bus, &hypercall_bus, &irq_chip_clone)
                 })
                 .context("failed to spawn vcpu thread")?;
             vcpu_handles.push(handle);
@@ -341,21 +343,43 @@ fn vcpu_loop(
     vcpu: &mut impl VcpuAArch64,
     io_bus: &devices::Bus,
     mmio_bus: &devices::Bus,
+    hypercall_bus: &devices::Bus,
     irq_chip: &devices::HvfGicChip,
 ) -> Result<ExitState> {
     use devices::IrqChip;
 
     info!("vCPU {} starting execution", vcpu.id());
 
+    let mut exit_count: u64 = 0;
+    let mut mmio_count: u64 = 0;
+    let mut hlt_count: u64 = 0;
+    let mut msr_count: u64 = 0;
+    let mut other_count: u64 = 0;
+
     loop {
         // Inject pending interrupts before running.
         irq_chip.inject_interrupts(vcpu as &dyn Vcpu)?;
 
         // Run the vCPU until an exit.
+        exit_count += 1;
+        if exit_count <= 20 || exit_count % 10000 == 0 {
+            info!(
+                "vCPU {} exit #{}: mmio={} hlt={} msr={} other={}",
+                vcpu.id(), exit_count, mmio_count, hlt_count, msr_count, other_count
+            );
+        }
+
         match vcpu.run() {
             Ok(exit) => match exit {
                 VcpuExit::Mmio => {
+                    mmio_count += 1;
                     if let Err(e) = vcpu.handle_mmio(&mut |IoParams { address, operation }| {
+                        if mmio_count <= 10 {
+                            info!("  MMIO {:?} @ {:#x}", match &operation {
+                                IoOperation::Read(_) => "read",
+                                IoOperation::Write(_) => "write",
+                            }, address);
+                        }
                         match operation {
                             IoOperation::Read(data) => {
                                 mmio_bus.read(address, data);
@@ -374,6 +398,7 @@ fn vcpu_loop(
                     // x86-only, shouldn't happen on aarch64
                 }
                 VcpuExit::Hlt => {
+                    hlt_count += 1;
                     // WFI — CPU is idle, continue (will block in next run)
                 }
                 VcpuExit::Shutdown(_) => {
@@ -395,8 +420,26 @@ fn vcpu_loop(
                     error!("vCPU {} system event crash", vcpu.id());
                     return Ok(ExitState::Crash);
                 }
+                VcpuExit::MsrAccess => {
+                    msr_count += 1;
+                    if msr_count <= 5 {
+                        info!("vCPU {} MsrAccess (system register trap)", vcpu.id());
+                    }
+                }
+                VcpuExit::Hypercall => {
+                    if let Err(e) = vcpu.handle_hypercall(
+                        &mut |abi| hypercall_bus.handle_hypercall(abi),
+                    ) {
+                        if exit_count <= 20 {
+                            error!("vCPU {} hypercall error: {}", vcpu.id(), e);
+                        }
+                    }
+                }
                 other => {
-                    debug!("vCPU {} unhandled exit: {:?}", vcpu.id(), other);
+                    other_count += 1;
+                    if other_count <= 10 {
+                        info!("vCPU {} unhandled exit: {:?}", vcpu.id(), other);
+                    }
                 }
             },
             Err(e) => {

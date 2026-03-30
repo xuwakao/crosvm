@@ -97,6 +97,32 @@ impl HvfVcpu {
         self.vcpu
     }
 
+    /// Handle a system register (MSR/MRS) trap.
+    /// The syndrome encodes the register, direction, and transfer register.
+    /// For most registers, we return 0 on read and ignore writes — this allows
+    /// the kernel to probe features without crashing.
+    fn handle_sysreg_trap(&mut self, syndrome: u64) -> Result<()> {
+        let is_read = ffi::sysreg_isread(syndrome);
+        let rt = ffi::sysreg_rt(syndrome);
+        let _op0 = ffi::sysreg_op0(syndrome);
+        let _op1 = ffi::sysreg_op1(syndrome);
+        let _crn = ffi::sysreg_crn(syndrome);
+        let _crm = ffi::sysreg_crm(syndrome);
+        let _op2 = ffi::sysreg_op2(syndrome);
+
+        if is_read {
+            // MRS Xt, <sysreg> — read from system register into Xt.
+            // Return 0 for unhandled registers (safe default for feature detection).
+            if rt < 31 {
+                self.set_reg(ffi::HV_REG_X0 + rt, 0)?;
+            }
+            // Xt=31 means XZR (zero register), no write needed.
+        }
+        // MSR <sysreg>, Xt — write to system register. Just ignore it.
+        // The kernel writes GIC configuration registers which we don't emulate.
+        Ok(())
+    }
+
     /// Read a system register.
     fn get_sys_reg(&self, reg: ffi::hv_sys_reg_t) -> Result<u64> {
         let mut val: u64 = 0;
@@ -170,7 +196,11 @@ impl Vcpu for HvfVcpu {
                     }
                     ffi::EC_SYSTEMREGISTERTRAP => {
                         // System register access trapped to hypervisor.
-                        Ok(VcpuExit::MsrAccess)
+                        // Syndrome encodes: direction (read/write), Rt, CRn, CRm, Op0, Op1, Op2.
+                        // We handle the access here and advance PC.
+                        self.handle_sysreg_trap(syndrome)?;
+                        self.advance_pc()?;
+                        Ok(VcpuExit::Intr) // Continue execution
                     }
                     ffi::EC_WFX_TRAP => {
                         if ffi::wfx_is_wfe(syndrome) {
@@ -196,9 +226,22 @@ impl Vcpu for HvfVcpu {
                     | ffi::EC_BREAKPOINT_SAME_EL
                     | ffi::EC_WATCHPOINT
                     | ffi::EC_WATCHPOINT_SAME_EL => Ok(VcpuExit::Debug),
-                    ffi::EC_INSNABORT | ffi::EC_INSNABORT_SAME_EL => Ok(VcpuExit::Exception),
+                    ffi::EC_INSNABORT | ffi::EC_INSNABORT_SAME_EL => {
+                        let ipa = exit.exception.physical_address;
+                        let pc = self.get_reg(ffi::HV_REG_PC).unwrap_or(0);
+                        base::error!(
+                            "HVF instruction abort: EC=0x{:x} IPA=0x{:x} PC=0x{:x} syndrome=0x{:x}",
+                            ec, ipa, pc, syndrome
+                        );
+                        Ok(VcpuExit::Exception)
+                    }
                     _ => {
-                        base::error!("unhandled HVF exception EC=0x{:x} syndrome=0x{:x}", ec, syndrome);
+                        let ipa = exit.exception.physical_address;
+                        let pc = self.get_reg(ffi::HV_REG_PC).unwrap_or(0);
+                        base::error!(
+                            "unhandled HVF exception EC=0x{:x} IPA=0x{:x} PC=0x{:x} syndrome=0x{:x}",
+                            ec, ipa, pc, syndrome
+                        );
                         Ok(VcpuExit::Exception)
                     }
                 }
@@ -269,6 +312,34 @@ impl Vcpu for HvfVcpu {
     fn handle_io(&self, _handle_fn: &mut dyn FnMut(IoParams)) -> Result<()> {
         // ARM64 does not have IO port instructions.
         Err(Error::new(libc::ENOTSUP))
+    }
+
+    fn handle_hypercall(
+        &self,
+        handle_fn: &mut dyn FnMut(&mut crate::HypercallAbi) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        const SMCCC_NOT_SUPPORTED: usize = u64::MAX as usize;
+
+        // SMCCC: FID in W0, args in X1-X3, results in X0-X3.
+        let function_id = (self.get_one_reg(VcpuRegAArch64::X(0))? as u32)
+            .try_into()
+            .unwrap();
+        let args = &[
+            self.get_one_reg(VcpuRegAArch64::X(1))?.try_into().unwrap(),
+            self.get_one_reg(VcpuRegAArch64::X(2))?.try_into().unwrap(),
+            self.get_one_reg(VcpuRegAArch64::X(3))?.try_into().unwrap(),
+        ];
+        let default_res = &[SMCCC_NOT_SUPPORTED, 0, 0, 0];
+
+        let mut smccc_abi = crate::HypercallAbi::new(function_id, args, default_res);
+
+        let result = handle_fn(&mut smccc_abi);
+
+        for (i, value) in smccc_abi.get_results().iter().enumerate() {
+            self.set_one_reg(VcpuRegAArch64::X(i as _), (*value).try_into().unwrap())?;
+        }
+
+        result
     }
 
     fn on_suspend(&self) -> Result<()> {

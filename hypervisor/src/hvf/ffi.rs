@@ -124,10 +124,46 @@ pub fn sysreg_isread(syndrome: u64) -> bool {
     (syndrome & 1) != 0
 }
 
-/// System register trap: extract target register
+/// System register trap: extract target register (Xt)
 #[inline]
 pub fn sysreg_rt(syndrome: u64) -> u32 {
     ((syndrome >> 5) & 0x1f) as u32
+}
+
+/// System register trap: extract CRm
+#[inline]
+pub fn sysreg_crm(syndrome: u64) -> u32 {
+    ((syndrome >> 1) & 0xf) as u32
+}
+
+/// System register trap: extract CRn
+#[inline]
+pub fn sysreg_crn(syndrome: u64) -> u32 {
+    ((syndrome >> 10) & 0xf) as u32
+}
+
+/// System register trap: extract Op1
+#[inline]
+pub fn sysreg_op1(syndrome: u64) -> u32 {
+    ((syndrome >> 14) & 0x7) as u32
+}
+
+/// System register trap: extract Op2
+#[inline]
+pub fn sysreg_op2(syndrome: u64) -> u32 {
+    ((syndrome >> 17) & 0x7) as u32
+}
+
+/// System register trap: extract Op0
+#[inline]
+pub fn sysreg_op0(syndrome: u64) -> u32 {
+    ((syndrome >> 20) & 0x3) as u32
+}
+
+/// Encode a system register ID from Op0, Op1, CRn, CRm, Op2
+#[inline]
+pub fn sysreg_encode(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
+    (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
 }
 
 /// WFx trap: is it WFE (true) or WFI (false)?
