@@ -99,28 +99,77 @@ impl HvfVcpu {
 
     /// Handle a system register (MSR/MRS) trap.
     /// The syndrome encodes the register, direction, and transfer register.
-    /// For most registers, we return 0 on read and ignore writes — this allows
-    /// the kernel to probe features without crashing.
+    /// First tries HVF's own sysreg access; for GIC ICC registers, returns
+    /// sensible defaults; for unknown registers, returns 0 on read.
     fn handle_sysreg_trap(&mut self, syndrome: u64) -> Result<()> {
         let is_read = ffi::sysreg_isread(syndrome);
         let rt = ffi::sysreg_rt(syndrome);
-        let _op0 = ffi::sysreg_op0(syndrome);
-        let _op1 = ffi::sysreg_op1(syndrome);
-        let _crn = ffi::sysreg_crn(syndrome);
-        let _crm = ffi::sysreg_crm(syndrome);
-        let _op2 = ffi::sysreg_op2(syndrome);
+        let op0 = ffi::sysreg_op0(syndrome);
+        let op1 = ffi::sysreg_op1(syndrome);
+        let crn = ffi::sysreg_crn(syndrome);
+        let crm = ffi::sysreg_crm(syndrome);
+        let op2 = ffi::sysreg_op2(syndrome);
+
+        let reg_id = ffi::sysreg_encode(op0, op1, crn, crm, op2);
 
         if is_read {
-            // MRS Xt, <sysreg> — read from system register into Xt.
-            // Return 0 for unhandled registers (safe default for feature detection).
+            // MRS Xt, <sysreg>
+            let value = self.read_sysreg_value(reg_id);
             if rt < 31 {
-                self.set_reg(ffi::HV_REG_X0 + rt, 0)?;
+                self.set_reg(ffi::HV_REG_X0 + rt, value)?;
             }
-            // Xt=31 means XZR (zero register), no write needed.
+        } else {
+            // MSR <sysreg>, Xt
+            let value = if rt < 31 {
+                self.get_reg(ffi::HV_REG_X0 + rt)?
+            } else {
+                0 // XZR
+            };
+            self.write_sysreg_value(reg_id, value);
         }
-        // MSR <sysreg>, Xt — write to system register. Just ignore it.
-        // The kernel writes GIC configuration registers which we don't emulate.
         Ok(())
+    }
+
+    /// Read a trapped system register value.
+    /// Tries HVF first, falls back to GIC ICC register defaults.
+    fn read_sysreg_value(&self, reg_id: u16) -> u64 {
+        // Try HVF's own register access first.
+        let mut val: u64 = 0;
+        let ret = unsafe { ffi::hv_vcpu_get_sys_reg(self.vcpu, reg_id, &mut val) };
+        if ret == ffi::HV_SUCCESS {
+            return val;
+        }
+
+        // GIC ICC system registers (Op0=3, Op1=0, CRn=12)
+        // ICC_SRE_EL1: Op0=3, Op1=0, CRn=12, CRm=12, Op2=5 => enable system register interface
+        let icc_sre_el1 = ffi::sysreg_encode(3, 0, 12, 12, 5);
+        // ICC_CTLR_EL1: Op0=3, Op1=0, CRn=12, CRm=12, Op2=4
+        let icc_ctlr_el1 = ffi::sysreg_encode(3, 0, 12, 12, 4);
+        // ICC_PMR_EL1: Op0=3, Op1=0, CRn=4, CRm=6, Op2=0
+        let icc_pmr_el1 = ffi::sysreg_encode(3, 0, 4, 6, 0);
+        // ICC_IAR1_EL1: Op0=3, Op1=0, CRn=12, CRm=12, Op2=0 (interrupt acknowledge)
+        let icc_iar1_el1 = ffi::sysreg_encode(3, 0, 12, 12, 0);
+        // ICC_IGRPEN1_EL1: Op0=3, Op1=0, CRn=12, CRm=12, Op2=7
+        let icc_igrpen1_el1 = ffi::sysreg_encode(3, 0, 12, 12, 7);
+
+        match reg_id {
+            x if x == icc_sre_el1 => 0x7,    // SRE=1, DFB=1, DIB=1 (system registers enabled)
+            x if x == icc_ctlr_el1 => 0x0,   // Default control
+            x if x == icc_pmr_el1 => 0xff,    // All priorities enabled
+            x if x == icc_iar1_el1 => 1023,   // Spurious interrupt (no pending IRQ)
+            x if x == icc_igrpen1_el1 => 0x1, // Group 1 enabled
+            _ => 0,                            // Unknown register — return 0
+        }
+    }
+
+    /// Write a trapped system register value.
+    fn write_sysreg_value(&self, reg_id: u16, value: u64) {
+        // Try HVF's own register access first.
+        let ret = unsafe { ffi::hv_vcpu_set_sys_reg(self.vcpu, reg_id, value) };
+        if ret == ffi::HV_SUCCESS {
+            return;
+        }
+        // Silently ignore writes to unrecognized registers.
     }
 
     /// Read a system register.

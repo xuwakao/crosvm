@@ -362,10 +362,11 @@ fn vcpu_loop(
 
         // Run the vCPU until an exit.
         exit_count += 1;
-        if exit_count <= 20 || exit_count % 10000 == 0 {
+        if exit_count <= 100 || exit_count % 100000 == 0 {
+            let pc = vcpu.get_one_reg(hypervisor::VcpuRegAArch64::Pc).unwrap_or(0);
             info!(
-                "vCPU {} exit #{}: mmio={} hlt={} msr={} other={}",
-                vcpu.id(), exit_count, mmio_count, hlt_count, msr_count, other_count
+                "vCPU {} exit #{}: mmio={} hlt={} msr={} other={} PC={:#x}",
+                vcpu.id(), exit_count, mmio_count, hlt_count, msr_count, other_count, pc
             );
         }
 
@@ -374,7 +375,7 @@ fn vcpu_loop(
                 VcpuExit::Mmio => {
                     mmio_count += 1;
                     if let Err(e) = vcpu.handle_mmio(&mut |IoParams { address, operation }| {
-                        if mmio_count <= 10 {
+                        if mmio_count <= 50 {
                             info!("  MMIO {:?} @ {:#x}", match &operation {
                                 IoOperation::Read(_) => "read",
                                 IoOperation::Write(_) => "write",
@@ -427,9 +428,61 @@ fn vcpu_loop(
                     }
                 }
                 VcpuExit::Hypercall => {
-                    if let Err(e) = vcpu.handle_hypercall(
-                        &mut |abi| hypercall_bus.handle_hypercall(abi),
-                    ) {
+                    // Handle PSCI calls directly, dispatch others to hypercall bus.
+                    if let Err(e) = vcpu.handle_hypercall(&mut |abi| {
+                        let fid = abi.hypercall_id();
+                        match fid {
+                            // PSCI_VERSION (returns PSCI 1.0 = 0x10000)
+                            0x84000000 => {
+                                abi.set_results(&[0x10000, 0, 0, 0]);
+                                Ok(())
+                            }
+                            // PSCI_MIGRATE_INFO_TYPE (returns TOS_NOT_PRESENT_MP)
+                            0x84000006 => {
+                                abi.set_results(&[2, 0, 0, 0]);
+                                Ok(())
+                            }
+                            // PSCI_FEATURES
+                            0x8400000a => {
+                                let feature_id = abi.get_argument(0).copied().unwrap_or(0);
+                                match feature_id {
+                                    0x84000000 | 0x84000001 | 0x84000002 | 0xc4000003 |
+                                    0x84000008 | 0x84000009 => {
+                                        abi.set_results(&[0, 0, 0, 0]); // Supported
+                                    }
+                                    _ => {
+                                        abi.set_results(&[u64::MAX as usize, 0, 0, 0]); // NOT_SUPPORTED
+                                    }
+                                }
+                                Ok(())
+                            }
+                            // PSCI_CPU_OFF
+                            0x84000002 => {
+                                abi.set_results(&[0, 0, 0, 0]);
+                                Ok(())
+                            }
+                            // PSCI_CPU_ON (64-bit)
+                            0xc4000003 => {
+                                abi.set_results(&[0, 0, 0, 0]);
+                                Ok(())
+                            }
+                            // PSCI_SYSTEM_OFF
+                            0x84000008 => {
+                                info!("vCPU {} PSCI SYSTEM_OFF", vcpu.id());
+                                abi.set_results(&[0, 0, 0, 0]);
+                                Ok(())
+                            }
+                            // PSCI_SYSTEM_RESET
+                            0x84000009 => {
+                                info!("vCPU {} PSCI SYSTEM_RESET", vcpu.id());
+                                abi.set_results(&[0, 0, 0, 0]);
+                                Ok(())
+                            }
+                            _ => {
+                                hypercall_bus.handle_hypercall(abi)
+                            }
+                        }
+                    }) {
                         if exit_count <= 20 {
                             error!("vCPU {} hypercall error: {}", vcpu.id(), e);
                         }

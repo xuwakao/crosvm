@@ -160,10 +160,10 @@ pub fn sysreg_op0(syndrome: u64) -> u32 {
     ((syndrome >> 20) & 0x3) as u32
 }
 
-/// Encode a system register ID from Op0, Op1, CRn, CRm, Op2
+/// Encode a system register ID from Op0, Op1, CRn, CRm, Op2 in HVF format.
 #[inline]
-pub fn sysreg_encode(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
-    (op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2
+pub fn sysreg_encode(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u16 {
+    ((op0 << 14) | (op1 << 11) | (crn << 7) | (crm << 3) | op2) as u16
 }
 
 /// WFx trap: is it WFE (true) or WFI (false)?
