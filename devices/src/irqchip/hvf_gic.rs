@@ -33,6 +33,7 @@ struct IrqEvent {
     gsi: u32,
     trigger_event: Event,
     source: IrqEventSource,
+    level_triggered: bool,
 }
 
 /// Minimal IRQ chip for HVF on macOS.
@@ -93,6 +94,7 @@ impl IrqChip for HvfGicChip {
             gsi: irq,
             trigger_event: irq_event.get_trigger().try_clone()?,
             source,
+            level_triggered: false,
         });
         Ok(Some(index))
     }
@@ -114,6 +116,7 @@ impl IrqChip for HvfGicChip {
             gsi: irq,
             trigger_event: irq_event.get_trigger().try_clone()?,
             source,
+            level_triggered: true,
         });
         Ok(Some(index))
     }
@@ -157,7 +160,8 @@ impl IrqChip for HvfGicChip {
         let events = self.irq_events.lock();
         if let Some(irq_event) = events.get(event_index) {
             let gsi = irq_event.gsi;
-            // Clear the event (edge-triggered: auto-deassert).
+            let is_level = irq_event.level_triggered;
+            // Clear the event so the IRQ handler doesn't re-enter immediately.
             let _ = irq_event.trigger_event.wait();
 
             // Mark IRQ as pending.
@@ -171,15 +175,18 @@ impl IrqChip for HvfGicChip {
             use hypervisor::hvf::ffi;
             if ffi::hvf_gic_is_available() {
                 // macOS 15+: Use native HVF GIC to inject SPI.
-                // SPI INTIDs start at GIC_SPI_BASE (32); GSI 0 = INTID 32.
                 let intid = gsi + ffi::GIC_SPI_BASE;
-                // Edge-triggered: assert then deassert to create a rising edge.
                 let ret = unsafe { ffi::hv_gic_set_spi(intid, true) };
                 if ret != ffi::HV_SUCCESS {
                     base::error!("hv_gic_set_spi({}, true) failed: {}", intid, ret);
                 }
-                // Deassert immediately so next event creates a new edge.
-                unsafe { ffi::hv_gic_set_spi(intid, false) };
+                if !is_level {
+                    // Edge-triggered: deassert immediately to create a rising edge.
+                    unsafe { ffi::hv_gic_set_spi(intid, false) };
+                }
+                // Level-triggered: keep asserted. The GIC will deliver the interrupt
+                // to the guest. When the guest EOIs, the GIC deasserts automatically
+                // for level-sensitive SPIs configured via hv_gic_set_spi.
             } else {
                 // macOS <15: Fallback — inject physical IRQ signal to all vCPUs.
                 let handles = self.vcpu_handles.lock();
