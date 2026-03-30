@@ -115,6 +115,10 @@ impl HvfVcpu {
         if is_read {
             // MRS Xt, <sysreg>
             let value = self.read_sysreg_value(reg_id);
+            base::info!(
+                "  sysreg MRS X{}, S{}_{}_C{}_C{}_{} (id={:#06x}) → {:#x}",
+                rt, op0, op1, crn, crm, op2, reg_id, value
+            );
             if rt < 31 {
                 self.set_reg(ffi::HV_REG_X0 + rt, value)?;
             }
@@ -125,6 +129,10 @@ impl HvfVcpu {
             } else {
                 0 // XZR
             };
+            base::info!(
+                "  sysreg MSR S{}_{}_C{}_C{}_{} (id={:#06x}), X{} ← {:#x}",
+                op0, op1, crn, crm, op2, reg_id, rt, value
+            );
             self.write_sysreg_value(reg_id, value);
         }
         Ok(())
@@ -240,7 +248,6 @@ impl Vcpu for HvfVcpu {
 
                 match ec {
                     ffi::EC_DATAABORT | ffi::EC_DATAABORT_SAME_EL => {
-                        // MMIO access — the most common exit.
                         Ok(VcpuExit::Mmio)
                     }
                     ffi::EC_SYSTEMREGISTERTRAP => {

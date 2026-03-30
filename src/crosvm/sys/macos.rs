@@ -125,7 +125,9 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         initrd_image,
         extra_kernel_params: {
             let mut params = cfg.params.clone();
-            params.push("earlycon=uart8250,mmio,0x3f8".to_string());
+            params.push("earlycon=uart8250,mmio32,0x3f8".to_string());
+            params.push("panic=30".to_string());
+            params.push("keep_bootcon".to_string());
             params
         },
         acpi_sdts: Vec::new(),
@@ -249,7 +251,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             devices,
             &mut irq_chip,
             &mut vcpu_ids,
-            None, // dump_device_tree_blob
+            Some(std::path::PathBuf::from("/tmp/crosvm_fdt.dtb")), // dump FDT for debugging
             None, // debugcon_jail
             #[cfg(feature = "swap")]
             &mut None,
@@ -362,6 +364,8 @@ fn vcpu_loop(
     let mut mmio_count: u64 = 0;
     let mut hlt_count: u64 = 0;
     let mut msr_count: u64 = 0;
+    let mut intr_count: u64 = 0;
+    let mut hyper_count: u64 = 0;
     let mut other_count: u64 = 0;
 
     loop {
@@ -373,8 +377,8 @@ fn vcpu_loop(
         if exit_count <= 100 || exit_count % 100000 == 0 {
             let pc = vcpu.get_one_reg(hypervisor::VcpuRegAArch64::Pc).unwrap_or(0);
             info!(
-                "vCPU {} exit #{}: mmio={} hlt={} msr={} other={} PC={:#x}",
-                vcpu.id(), exit_count, mmio_count, hlt_count, msr_count, other_count, pc
+                "vCPU {} exit #{}: mmio={} hlt={} intr={} hyper={} msr={} other={} PC={:#x}",
+                vcpu.id(), exit_count, mmio_count, hlt_count, intr_count, hyper_count, msr_count, other_count, pc
             );
         }
 
@@ -383,18 +387,44 @@ fn vcpu_loop(
                 VcpuExit::Mmio => {
                     mmio_count += 1;
                     if let Err(e) = vcpu.handle_mmio(&mut |IoParams { address, operation }| {
-                        if mmio_count <= 50 {
-                            info!("  MMIO {:?} @ {:#x}", match &operation {
-                                IoOperation::Read(_) => "read",
-                                IoOperation::Write(_) => "write",
-                            }, address);
-                        }
                         match operation {
                             IoOperation::Read(data) => {
                                 mmio_bus.read(address, data);
+                                // Log ALL reads with returned data
+                                if mmio_count <= 200 {
+                                    let val = match data.len() {
+                                        1 => data[0] as u64,
+                                        2 => u16::from_le_bytes([data[0], data[1]]) as u64,
+                                        4 => u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64,
+                                        8 => u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]),
+                                        _ => 0,
+                                    };
+                                    info!("  MMIO read  @ {:#x} [{}B] → {:#x}", address, data.len(), val);
+                                }
                                 Ok(())
                             }
                             IoOperation::Write(data) => {
+                                // Detect serial writes at 0x3f8 (THR register)
+                                if address >= 0x3f8 && address < 0x400 {
+                                    if data.len() >= 1 {
+                                        let ch = data[0];
+                                        if ch >= 0x20 && ch < 0x7f {
+                                            error!("SERIAL OUTPUT: '{}'", ch as char);
+                                        } else {
+                                            error!("SERIAL OUTPUT: byte {:#x}", ch);
+                                        }
+                                    }
+                                }
+                                if mmio_count <= 200 {
+                                    let val = match data.len() {
+                                        1 => data[0] as u64,
+                                        2 => u16::from_le_bytes([data[0], data[1]]) as u64,
+                                        4 => u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64,
+                                        8 => u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]),
+                                        _ => 0,
+                                    };
+                                    info!("  MMIO write @ {:#x} [{}B] ← {:#x}", address, data.len(), val);
+                                }
                                 mmio_bus.write(address, data);
                                 Ok(())
                             }
@@ -415,7 +445,7 @@ fn vcpu_loop(
                     return Ok(ExitState::Stop);
                 }
                 VcpuExit::Intr => {
-                    // External interrupt — loop back and inject.
+                    intr_count += 1;
                 }
                 VcpuExit::SystemEventShutdown => {
                     info!("vCPU {} system event shutdown", vcpu.id());
@@ -436,6 +466,7 @@ fn vcpu_loop(
                     }
                 }
                 VcpuExit::Hypercall => {
+                    hyper_count += 1;
                     // Handle PSCI calls directly, dispatch others to hypercall bus.
                     if let Err(e) = vcpu.handle_hypercall(&mut |abi| {
                         let fid = abi.hypercall_id();
@@ -482,14 +513,19 @@ fn vcpu_loop(
                             }
                             // PSCI_SYSTEM_RESET
                             0x84000009 => {
-                                // Dump register state before reset
-                                let pc = vcpu.get_one_reg(hypervisor::VcpuRegAArch64::Pc).unwrap_or(0);
-                                let lr = vcpu.get_one_reg(hypervisor::VcpuRegAArch64::X(30)).unwrap_or(0);
-                                let x0 = vcpu.get_one_reg(hypervisor::VcpuRegAArch64::X(0)).unwrap_or(0);
-                                error!(
-                                    "vCPU {} PSCI SYSTEM_RESET at PC={:#x} LR={:#x} X0={:#x} (mmio={} exits={})",
-                                    vcpu.id(), pc, lr, x0, mmio_count, exit_count
-                                );
+                                // Full register dump before reset
+                                use hypervisor::VcpuRegAArch64;
+                                let pc = vcpu.get_one_reg(VcpuRegAArch64::Pc).unwrap_or(0);
+                                let sp = vcpu.get_one_reg(VcpuRegAArch64::Sp).unwrap_or(0);
+                                error!("=== PSCI SYSTEM_RESET (mmio={} exits={}) ===", mmio_count, exit_count);
+                                error!("  PC={:#018x}  SP={:#018x}", pc, sp);
+                                for i in (0..31).step_by(4) {
+                                    let r = |n: u8| vcpu.get_one_reg(VcpuRegAArch64::X(n)).unwrap_or(0);
+                                    if i + 3 < 31 {
+                                        error!("  X{:02}={:#018x} X{:02}={:#018x} X{:02}={:#018x} X{:02}={:#018x}",
+                                            i, r(i), i+1, r(i+1), i+2, r(i+2), i+3, r(i+3));
+                                    }
+                                }
                                 abi.set_results(&[0, 0, 0, 0]);
                                 Ok(())
                             }
