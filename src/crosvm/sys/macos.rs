@@ -123,7 +123,11 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         pflash_block_size: 0,
         pflash_image: None,
         initrd_image,
-        extra_kernel_params: cfg.params.clone(),
+        extra_kernel_params: {
+            let mut params = cfg.params.clone();
+            params.push("earlycon=uart8250,mmio,0x3f8".to_string());
+            params
+        },
         acpi_sdts: Vec::new(),
         rt_cpus: cfg.rt_cpus.clone(),
         delay_rt: cfg.delay_rt,
@@ -199,9 +203,13 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         let vm = HvfVm::new(hvf, guest_mem)
             .context("failed to create HVF VM")?;
 
-        // Set up default serial parameters (COM1 = stdout console).
+        // Set up default serial parameters (COM1 = stdout console with earlycon).
         let mut serial_parameters = cfg.serial_parameters.clone();
         set_default_serial_parameters(&mut serial_parameters, false);
+        // Enable earlycon on COM1 for immediate serial output during boot.
+        if let Some(params) = serial_parameters.get_mut(&(SerialHardware::Serial, 1)) {
+            params.earlycon = true;
+        }
 
         // Create system allocator.
         let pstore_size = components.pstore.as_ref().map(|p| p.size as u64);
@@ -474,7 +482,14 @@ fn vcpu_loop(
                             }
                             // PSCI_SYSTEM_RESET
                             0x84000009 => {
-                                info!("vCPU {} PSCI SYSTEM_RESET", vcpu.id());
+                                // Dump register state before reset
+                                let pc = vcpu.get_one_reg(hypervisor::VcpuRegAArch64::Pc).unwrap_or(0);
+                                let lr = vcpu.get_one_reg(hypervisor::VcpuRegAArch64::X(30)).unwrap_or(0);
+                                let x0 = vcpu.get_one_reg(hypervisor::VcpuRegAArch64::X(0)).unwrap_or(0);
+                                error!(
+                                    "vCPU {} PSCI SYSTEM_RESET at PC={:#x} LR={:#x} X0={:#x} (mmio={} exits={})",
+                                    vcpu.id(), pc, lr, x0, mmio_count, exit_count
+                                );
                                 abi.set_results(&[0, 0, 0, 0]);
                                 Ok(())
                             }
