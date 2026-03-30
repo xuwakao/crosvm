@@ -47,6 +47,9 @@ pub struct HvfGicChip {
     irq_events: Arc<Mutex<Vec<IrqEvent>>>,
     // Track which IRQs are pending (one bool per GSI).
     pending_irqs: Arc<Mutex<Vec<bool>>>,
+    // Track which SPIs are currently asserted via hv_gic_set_spi.
+    // inject_interrupts deasserts these after the vCPU has had a chance to process.
+    asserted_spis: Arc<Mutex<Vec<bool>>>,
     // HVF vCPU handles for cross-thread interrupt injection.
     vcpu_handles: Arc<Mutex<Vec<u64>>>,
 }
@@ -60,6 +63,7 @@ impl HvfGicChip {
             num_vcpus,
             irq_events: Arc::new(Mutex::new(Vec::new())),
             pending_irqs: Arc::new(Mutex::new(vec![false; MAX_IRQS])),
+            asserted_spis: Arc::new(Mutex::new(vec![false; MAX_IRQS])),
             vcpu_handles: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -171,22 +175,30 @@ impl IrqChip for HvfGicChip {
             }
             drop(pending);
 
-            // Inject interrupt via the best available mechanism.
+            // Signal the interrupt to the vCPU via hv_gic_set_spi (edge pattern)
+            // AND hv_vcpu_cancel to force the vCPU loop to call inject_interrupts.
+            //
+            // The native GIC path (hv_gic_set_spi) delivers the interrupt through
+            // the virtual GIC hardware. The edge pattern (assert+deassert) creates
+            // a pending SPI that the GIC delivers to the vCPU. However, this alone
+            // may not cause hv_vcpu_run to exit — the interrupt is handled inside
+            // the guest transparently. hv_vcpu_cancel forces the exit so that
+            // inject_interrupts runs and additional pending state is processed.
             use hypervisor::hvf::ffi;
-            if ffi::hvf_gic_is_available() {
-                // macOS 15+: Use native HVF GIC to inject SPI.
+            if hypervisor::hvf::ffi::hvf_gic_is_available() {
+                use hypervisor::hvf::ffi;
                 let intid = gsi + ffi::GIC_SPI_BASE;
-                let ret = unsafe { ffi::hv_gic_set_spi(intid, true) };
-                if ret != ffi::HV_SUCCESS {
-                    base::error!("hv_gic_set_spi({}, true) failed: {}", intid, ret);
-                }
-                if !is_level {
-                    // Edge-triggered: deassert immediately to create a rising edge.
+                // Deassert any previously asserted SPI for this GSI first,
+                // creating a clean edge for the new assertion.
+                let mut asserted = self.asserted_spis.lock();
+                if (gsi as usize) < asserted.len() && asserted[gsi as usize] {
                     unsafe { ffi::hv_gic_set_spi(intid, false) };
                 }
-                // Level-triggered: keep asserted. The GIC will deliver the interrupt
-                // to the guest. When the guest EOIs, the GIC deasserts automatically
-                // for level-sensitive SPIs configured via hv_gic_set_spi.
+                // Assert the SPI. Track that it's asserted.
+                unsafe { ffi::hv_gic_set_spi(intid, true) };
+                if (gsi as usize) < asserted.len() {
+                    asserted[gsi as usize] = true;
+                }
             } else {
                 // macOS <15: Fallback — inject physical IRQ signal to all vCPUs.
                 let handles = self.vcpu_handles.lock();
@@ -234,9 +246,21 @@ impl IrqChip for HvfGicChip {
             if ret != ffi::HV_SUCCESS {
                 return Err(Error::new(libc::EIO));
             }
-            // Clear all pending (edge-triggered: inject once).
+            // Clear all pending after injection.
             for p in pending.iter_mut() {
                 *p = false;
+            }
+            // Deassert any previously asserted SPIs. The guest has had at
+            // least one hv_vcpu_run iteration to process the interrupt.
+            if ffi::hvf_gic_is_available() {
+                let mut asserted = self.asserted_spis.lock();
+                for (i, a) in asserted.iter_mut().enumerate() {
+                    if *a {
+                        let intid = i as u32 + ffi::GIC_SPI_BASE;
+                        unsafe { ffi::hv_gic_set_spi(intid, false) };
+                        *a = false;
+                    }
+                }
             }
         } else {
             // Deassert IRQ line if nothing pending.
@@ -282,6 +306,7 @@ impl IrqChip for HvfGicChip {
             num_vcpus: self.num_vcpus,
             irq_events: Arc::clone(&self.irq_events),
             pending_irqs: Arc::clone(&self.pending_irqs),
+            asserted_spis: Arc::clone(&self.asserted_spis),
             vcpu_handles: Arc::clone(&self.vcpu_handles),
         })
     }
