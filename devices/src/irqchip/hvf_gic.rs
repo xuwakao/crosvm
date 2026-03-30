@@ -156,7 +156,6 @@ impl IrqChip for HvfGicChip {
     fn service_irq_event(&mut self, event_index: IrqEventIndex) -> Result<()> {
         let events = self.irq_events.lock();
         if let Some(irq_event) = events.get(event_index) {
-            base::info!("service_irq_event: index={} gsi={} source={}", event_index, irq_event.gsi, irq_event.source.device_name);
             let gsi = irq_event.gsi;
             // Clear the event (edge-triggered: auto-deassert).
             let _ = irq_event.trigger_event.wait();

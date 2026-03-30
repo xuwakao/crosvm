@@ -123,14 +123,7 @@ fn setup_vm_components(cfg: &Config) -> Result<VmComponents> {
         pflash_block_size: 0,
         pflash_image: None,
         initrd_image,
-        extra_kernel_params: {
-            let mut params = cfg.params.clone();
-            params.push("earlycon=uart8250,mmio32,0x3f8".to_string());
-            params.push("panic=30".to_string());
-            params.push("keep_bootcon".to_string());
-            params.push("rdinit=/init".to_string());
-            params
-        },
+        extra_kernel_params: cfg.params.clone(),
         acpi_sdts: Vec::new(),
         rt_cpus: cfg.rt_cpus.clone(),
         delay_rt: cfg.delay_rt,
@@ -252,7 +245,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             devices,
             &mut irq_chip,
             &mut vcpu_ids,
-            Some(std::path::PathBuf::from("/tmp/crosvm_fdt.dtb")), // dump FDT for debugging
+            cfg.dump_device_tree_blob.clone(),
             None, // debugcon_jail
             #[cfg(feature = "swap")]
             &mut None,
@@ -474,7 +467,6 @@ fn irq_handler_thread(
                     }
                 }
                 Token::IrqFd { index } => {
-                    info!("IRQ event {} fired!", index);
                     if let Err(e) = irq_chip_mut.service_irq_event(index) {
                         error!("failed to service IRQ event {}: {}", index, e);
                     }
@@ -486,7 +478,7 @@ fn irq_handler_thread(
     Ok(())
 }
 
-/// Minimal vCPU run loop.
+/// vCPU run loop — executes guest code and handles VM exits.
 #[cfg(target_arch = "aarch64")]
 fn vcpu_loop(
     vcpu: &mut impl VcpuAArch64,
@@ -497,199 +489,79 @@ fn vcpu_loop(
 ) -> Result<ExitState> {
     use devices::IrqChip;
 
-    info!("vCPU {} starting execution", vcpu.id());
-
-    let mut exit_count: u64 = 0;
-    let mut mmio_count: u64 = 0;
-    let mut hlt_count: u64 = 0;
-    let mut msr_count: u64 = 0;
-    let mut intr_count: u64 = 0;
-    let mut hyper_count: u64 = 0;
-    let mut other_count: u64 = 0;
-
     loop {
         // Inject pending interrupts before running.
         irq_chip.inject_interrupts(vcpu as &dyn Vcpu)?;
 
-        // Run the vCPU until an exit.
-        exit_count += 1;
-        if exit_count <= 100 || exit_count % 100000 == 0 {
-            let pc = vcpu.get_one_reg(hypervisor::VcpuRegAArch64::Pc).unwrap_or(0);
-            info!(
-                "vCPU {} exit #{}: mmio={} hlt={} intr={} hyper={} msr={} other={} PC={:#x}",
-                vcpu.id(), exit_count, mmio_count, hlt_count, intr_count, hyper_count, msr_count, other_count, pc
-            );
-        }
-
         match vcpu.run() {
             Ok(exit) => match exit {
                 VcpuExit::Mmio => {
-                    mmio_count += 1;
                     if let Err(e) = vcpu.handle_mmio(&mut |IoParams { address, operation }| {
                         match operation {
                             IoOperation::Read(data) => {
                                 mmio_bus.read(address, data);
-                                // Log serial range reads
-                                if address >= 0x3f8 && address < 0x400 && mmio_count > 200 {
-                                    let val = match data.len() {
-                                        1 => data[0] as u64,
-                                        2 => u16::from_le_bytes([data[0], data[1]]) as u64,
-                                        4 => u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64,
-                                        8 => u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]),
-                                        _ => 0,
-                                    };
-                                    info!("  MMIO read  @ {:#x} [{}B] → {:#x}", address, data.len(), val);
-                                }
                                 Ok(())
                             }
                             IoOperation::Write(data) => {
-                                // Detect serial writes at 0x3f8 (THR register)
-                                if address >= 0x3f8 && address < 0x400 {
-                                    if data.len() >= 1 {
-                                        let ch = data[0];
-                                        if ch >= 0x20 && ch < 0x7f {
-                                            error!("SERIAL OUTPUT: '{}'", ch as char);
-                                        } else {
-                                            error!("SERIAL OUTPUT: byte {:#x}", ch);
-                                        }
-                                    }
-                                }
-                                // Log serial range writes always
-                                if address >= 0x3f8 && address < 0x400 && mmio_count > 200 {
-                                    let val = data[0] as u64;
-                                    if address == 0x3f8 && val >= 0x20 && val < 0x7f {
-                                        info!("  SERIAL TX: '{}'", val as u8 as char);
-                                    } else {
-                                        info!("  MMIO write @ {:#x} [{}B] ← {:#x}", address, data.len(), val);
-                                    }
-                                }
                                 mmio_bus.write(address, data);
                                 Ok(())
                             }
                         }
                     }) {
-                        error!("vCPU {} MMIO error: {}", vcpu.id(), e);
+                        error!("vCPU MMIO error: {}", e);
                     }
                 }
-                VcpuExit::Io => {
-                    // x86-only, shouldn't happen on aarch64
-                }
-                VcpuExit::Hlt => {
-                    hlt_count += 1;
-                    // WFI — CPU is idle, continue (will block in next run)
-                }
-                VcpuExit::Shutdown(_) => {
-                    info!("vCPU {} received shutdown", vcpu.id());
-                    return Ok(ExitState::Stop);
-                }
-                VcpuExit::Intr => {
-                    intr_count += 1;
-                    if intr_count <= 5 || intr_count % 10000 == 0 {
-                        let pc = vcpu.get_one_reg(hypervisor::VcpuRegAArch64::Pc).unwrap_or(0);
-                        info!("  Intr #{} PC={:#x}", intr_count, pc);
-                    }
-                }
-                VcpuExit::SystemEventShutdown => {
-                    info!("vCPU {} system event shutdown", vcpu.id());
-                    return Ok(ExitState::Stop);
-                }
-                VcpuExit::SystemEventReset => {
-                    info!("vCPU {} system event reset", vcpu.id());
-                    return Ok(ExitState::Reset);
-                }
-                VcpuExit::SystemEventCrash => {
-                    error!("vCPU {} system event crash", vcpu.id());
-                    return Ok(ExitState::Crash);
-                }
-                VcpuExit::MsrAccess => {
-                    msr_count += 1;
-                    if msr_count <= 5 {
-                        info!("vCPU {} MsrAccess (system register trap)", vcpu.id());
-                    }
-                }
+                VcpuExit::Io => {}
+                VcpuExit::Hlt => {}
+                VcpuExit::Intr => {}
+                VcpuExit::Shutdown(_) => return Ok(ExitState::Stop),
+                VcpuExit::SystemEventShutdown => return Ok(ExitState::Stop),
+                VcpuExit::SystemEventReset => return Ok(ExitState::Reset),
+                VcpuExit::SystemEventCrash => return Ok(ExitState::Crash),
                 VcpuExit::Hypercall => {
-                    hyper_count += 1;
-                    // Handle PSCI calls directly, dispatch others to hypercall bus.
+                    // PSCI calls handled inline; others dispatch to hypercall bus.
+                    // TODO(ISS-010): Move PSCI to a proper hypercall bus device.
                     if let Err(e) = vcpu.handle_hypercall(&mut |abi| {
                         let fid = abi.hypercall_id();
                         match fid {
-                            // PSCI_VERSION (returns PSCI 1.0 = 0x10000)
-                            0x84000000 => {
+                            0x84000000 => { // PSCI_VERSION → 1.0
                                 abi.set_results(&[0x10000, 0, 0, 0]);
                                 Ok(())
                             }
-                            // PSCI_MIGRATE_INFO_TYPE (returns TOS_NOT_PRESENT_MP)
-                            0x84000006 => {
+                            0x84000006 => { // PSCI_MIGRATE_INFO_TYPE → TOS_NOT_PRESENT_MP
                                 abi.set_results(&[2, 0, 0, 0]);
                                 Ok(())
                             }
-                            // PSCI_FEATURES
-                            0x8400000a => {
+                            0x8400000a => { // PSCI_FEATURES
                                 let feature_id = abi.get_argument(0).copied().unwrap_or(0);
-                                match feature_id {
+                                let supported = matches!(feature_id,
                                     0x84000000 | 0x84000001 | 0x84000002 | 0xc4000003 |
-                                    0x84000008 | 0x84000009 => {
-                                        abi.set_results(&[0, 0, 0, 0]); // Supported
-                                    }
-                                    _ => {
-                                        abi.set_results(&[u64::MAX as usize, 0, 0, 0]); // NOT_SUPPORTED
-                                    }
-                                }
+                                    0x84000008 | 0x84000009);
+                                abi.set_results(&[if supported { 0 } else { u64::MAX as usize }, 0, 0, 0]);
                                 Ok(())
                             }
-                            // PSCI_CPU_OFF
-                            0x84000002 => {
+                            0x84000002 | 0xc4000003 => { // PSCI_CPU_OFF / CPU_ON
                                 abi.set_results(&[0, 0, 0, 0]);
                                 Ok(())
                             }
-                            // PSCI_CPU_ON (64-bit)
-                            0xc4000003 => {
+                            0x84000008 => { // PSCI_SYSTEM_OFF
                                 abi.set_results(&[0, 0, 0, 0]);
                                 Ok(())
                             }
-                            // PSCI_SYSTEM_OFF
-                            0x84000008 => {
-                                info!("vCPU {} PSCI SYSTEM_OFF", vcpu.id());
+                            0x84000009 => { // PSCI_SYSTEM_RESET
                                 abi.set_results(&[0, 0, 0, 0]);
                                 Ok(())
                             }
-                            // PSCI_SYSTEM_RESET
-                            0x84000009 => {
-                                // Full register dump before reset
-                                use hypervisor::VcpuRegAArch64;
-                                let pc = vcpu.get_one_reg(VcpuRegAArch64::Pc).unwrap_or(0);
-                                let sp = vcpu.get_one_reg(VcpuRegAArch64::Sp).unwrap_or(0);
-                                error!("=== PSCI SYSTEM_RESET (mmio={} exits={}) ===", mmio_count, exit_count);
-                                error!("  PC={:#018x}  SP={:#018x}", pc, sp);
-                                for i in (0..31).step_by(4) {
-                                    let r = |n: u8| vcpu.get_one_reg(VcpuRegAArch64::X(n)).unwrap_or(0);
-                                    if i + 3 < 31 {
-                                        error!("  X{:02}={:#018x} X{:02}={:#018x} X{:02}={:#018x} X{:02}={:#018x}",
-                                            i, r(i), i+1, r(i+1), i+2, r(i+2), i+3, r(i+3));
-                                    }
-                                }
-                                abi.set_results(&[0, 0, 0, 0]);
-                                Ok(())
-                            }
-                            _ => {
-                                hypercall_bus.handle_hypercall(abi)
-                            }
+                            _ => hypercall_bus.handle_hypercall(abi),
                         }
                     }) {
-                        if exit_count <= 20 {
-                            error!("vCPU {} hypercall error: {}", vcpu.id(), e);
-                        }
+                        error!("hypercall error: {}", e);
                     }
                 }
-                other => {
-                    other_count += 1;
-                    if other_count <= 10 {
-                        info!("vCPU {} unhandled exit: {:?}", vcpu.id(), other);
-                    }
-                }
+                _ => {} // Ignore other exits
             },
             Err(e) => {
-                error!("vCPU {} run error: {}", vcpu.id(), e);
+                error!("vCPU run error: {}", e);
                 return Ok(ExitState::Crash);
             }
         }
