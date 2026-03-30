@@ -84,9 +84,9 @@ mod halla;
 #[cfg(all(target_arch = "aarch64", feature = "halla"))]
 pub use self::halla::HallaKernelIrqChip;
 
-#[cfg(all(target_arch = "aarch64", target_os = "macos", feature = "hvf"))]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 mod hvf_gic;
-#[cfg(all(target_arch = "aarch64", target_os = "macos", feature = "hvf"))]
+#[cfg(all(target_arch = "aarch64", target_os = "macos"))]
 pub use self::hvf_gic::HvfGicChip;
 
 pub type IrqEventIndex = usize;
