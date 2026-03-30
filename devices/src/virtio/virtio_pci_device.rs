@@ -942,9 +942,10 @@ impl PciDevice for VirtioPciDevice {
                     // triggers its event, which is equivalent to what the ioevent would do.
                     let queue_index = (offset - NOTIFICATION_BAR_OFFSET) as usize
                         / NOTIFY_OFF_MULTIPLIER as usize;
-                    trace!("write_bar notification fallback for queue {}", queue_index);
                     if let Some(evt) = self.queue_evts.get(queue_index) {
-                        let _ = evt.event.signal();
+                        if let Err(e) = evt.event.signal() {
+                            base::error!("notification fallback signal error for q{}: {}", queue_index, e);
+                        }
                     }
                 }
                 MSIX_TABLE_BAR_OFFSET..=MSIX_TABLE_LAST => {

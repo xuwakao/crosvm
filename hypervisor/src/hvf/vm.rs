@@ -310,11 +310,13 @@ impl Vm for HvfVm {
     }
 
     fn handle_io_events(&self, addr: IoEventAddress, _data: &[u8]) -> Result<()> {
-        if let Some(evt) = self.ioevents.lock().get(&addr) {
+        let map = self.ioevents.lock();
+        if let Some(evt) = map.get(&addr) {
             evt.signal()?;
         }
         Ok(())
     }
+
 
     fn get_pvclock(&self) -> Result<ClockState> {
         Err(base::Error::new(libc::ENOTSUP))

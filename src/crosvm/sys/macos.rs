@@ -268,11 +268,6 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             // construction, but the host side just needs to respond "Ok".
             let (ioevent_host_tube, ioevent_device_tube) =
                 Tube::pair().context("failed to create ioevent tube")?;
-            info!(
-                "ioevent tube pair: host_fd={}, device_fd={}",
-                base::AsRawDescriptor::as_raw_descriptor(&ioevent_host_tube),
-                base::AsRawDescriptor::as_raw_descriptor(&ioevent_device_tube),
-            );
             ioevent_host_tubes.push(ioevent_host_tube);
             // VM control tube: device-to-VMM control messages.
             let (_vm_host_tube, vm_device_tube) =
@@ -295,13 +290,6 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
 
         let mut vcpu_ids: Vec<usize> = (0..vcpu_count).collect();
 
-        // Verify ioevent device tube is still open before build_vm.
-        if !ioevent_host_tubes.is_empty() {
-            let host_fd = base::AsRawDescriptor::as_raw_descriptor(&ioevent_host_tubes[0]);
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            let fstat_ret = unsafe { libc::fstat(host_fd, &mut stat) };
-            info!("PRE build_vm: ioevent host fd={} fstat={}", host_fd, fstat_ret);
-        }
         info!("Building VM with Arch::build_vm...");
 
         // Build the VM — this creates serial devices, FDT, loads kernel, etc.
@@ -330,13 +318,6 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         .context("Arch::build_vm failed")?;
 
         info!("VM built successfully.");
-        // Verify ioevent host tube is still open after build_vm.
-        if !ioevent_host_tubes.is_empty() {
-            let host_fd = base::AsRawDescriptor::as_raw_descriptor(&ioevent_host_tubes[0]);
-            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-            let fstat_ret = unsafe { libc::fstat(host_fd, &mut stat) };
-            info!("POST build_vm: ioevent host fd={} fstat={}", host_fd, fstat_ret);
-        }
 
         // Spawn VM memory handler thread to process ioevent registration
         // requests from virtio devices. The device sends IoEventRaw requests
@@ -554,20 +535,11 @@ fn vm_memory_handler_thread(
         }
     }
 
-    info!(
-        "vm_memory handler started: {} tube(s), fd={}",
-        tubes.len(),
-        base::AsRawDescriptor::as_raw_descriptor(&tubes[0]),
-    );
+    info!("vm_memory handler started: {} tube(s)", tubes.len());
 
-    // Simple blocking recv loop for single tube.
+    // Blocking recv loop for single tube.
     if tubes.len() == 1 {
         let tube = &tubes[0];
-        // Check if fd 13 (device side) is still open from this thread
-        let mut s: libc::stat = unsafe { std::mem::zeroed() };
-        let f13 = unsafe { libc::fstat(13, &mut s) };
-        info!("vm_memory: fd 13 fstat from handler thread: {}", f13);
-        info!("vm_memory: waiting for first request...");
         loop {
             match tube.recv::<VmMemoryRequest>() {
                 Ok(request) => {
@@ -745,9 +717,7 @@ fn vcpu_loop(
                             }
                             IoOperation::Write(data) => {
                                 mmio_bus.write(address, data);
-                                // Signal ioevents for this address (HAXM/WHPX approach).
-                                // On macOS, kqueue fds can't be registered via tubes,
-                                // so we trigger ioevents on every MMIO write instead.
+                                // Signal ioevents for this address.
                                 let _ = vm.handle_io_events(
                                     hypervisor::IoEventAddress::Mmio(address),
                                     data,

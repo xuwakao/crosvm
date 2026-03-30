@@ -20,6 +20,7 @@ use crate::tube::Result;
 use crate::tube::SendTube;
 use crate::RawDescriptor;
 use crate::ReadNotifier;
+use crate::SafeDescriptor;
 use crate::ScmSocket;
 use crate::UnixSeqpacket;
 use crate::SCM_SOCKET_MAX_FD_COUNT;
@@ -75,8 +76,27 @@ impl Tube {
             return Err(Error::SendTooManyFds);
         }
 
-        handle_eintr!(self.socket.send_with_fds(&msg_json, &msg_descriptors))
-            .map_err(Error::Send)?;
+        // On macOS, Tubes use SOCK_STREAM which has no message boundaries.
+        // Prepend a 4-byte LE length header so the receiver knows how many
+        // bytes to read. File descriptors are sent as SCM_RIGHTS ancillary
+        // data with the header+payload (attached to the first sendmsg).
+        #[cfg(target_os = "macos")]
+        {
+            let len = msg_json.len() as u32;
+            let header = len.to_le_bytes();
+            let mut framed = Vec::with_capacity(4 + msg_json.len());
+            framed.extend_from_slice(&header);
+            framed.extend_from_slice(&msg_json);
+            handle_eintr!(self.socket.send_with_fds(&framed, &msg_descriptors))
+                .map_err(Error::Send)?;
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            handle_eintr!(self.socket.send_with_fds(&msg_json, &msg_descriptors))
+                .map_err(Error::Send)?;
+        }
+
         Ok(())
     }
 
@@ -93,30 +113,73 @@ impl Tube {
             return Err(Error::RecvTooManyFds);
         }
 
-        // WARNING: The `cros_async` and `base_tokio` tube wrappers both assume that, if the tube
-        // is readable, then a call to `Tube::recv` will not block (which ought to be true since we
-        // use SOCK_SEQPACKET and a single recvmsg call currently).
+        let (msg_json, msg_descriptors) = self.recv_raw(max_fds)?;
 
-        let msg_size =
-            handle_eintr!(self.socket.inner().next_packet_size()).map_err(Error::Recv)?;
-        // This buffer is the right size, as the size received in next_packet_size() represents the
-        // size of only the message itself and not the file descriptors. The descriptors are stored
-        // separately in msghdr::msg_control.
-        let mut msg_json = vec![0u8; msg_size];
-
-        let (msg_json_size, msg_descriptors) =
-            handle_eintr!(self.socket.recv_with_fds(&mut msg_json, max_fds))
-                .map_err(Error::Recv)?;
-
-        if msg_json_size == 0 {
+        if msg_json.is_empty() {
             return Err(Error::Disconnected);
         }
 
         deserialize_with_descriptors(
-            || serde_json::from_slice(&msg_json[0..msg_json_size]),
+            || serde_json::from_slice(&msg_json),
             msg_descriptors,
         )
         .map_err(Error::Json)
+    }
+
+    /// Low-level receive: returns the raw JSON bytes and any file descriptors.
+    fn recv_raw(&self, max_fds: usize) -> Result<(Vec<u8>, Vec<SafeDescriptor>)> {
+        cfg_if::cfg_if! {
+            if #[cfg(target_os = "macos")] {
+                // macOS SOCK_STREAM: read 4-byte LE length header, then payload.
+                // SCM_RIGHTS fds arrive with the first recvmsg.
+                //
+                // Read header + initial payload in one call for efficiency.
+                let mut header_buf = vec![0u8; 4 + 65536];
+                let (n, fds) = handle_eintr!(
+                    self.socket.recv_with_fds(&mut header_buf, max_fds)
+                ).map_err(Error::Recv)?;
+
+                if n < 4 {
+                    return Err(Error::Disconnected);
+                }
+
+                let payload_len = u32::from_le_bytes(
+                    [header_buf[0], header_buf[1], header_buf[2], header_buf[3]]
+                ) as usize;
+                let payload_in_first_read = n - 4;
+
+                let mut msg_json = vec![0u8; payload_len];
+                let copy_len = std::cmp::min(payload_in_first_read, payload_len);
+                msg_json[..copy_len].copy_from_slice(&header_buf[4..4 + copy_len]);
+
+                // Read remaining payload if the first recvmsg didn't get it all.
+                let mut total = copy_len;
+                while total < payload_len {
+                    let (n, _) = handle_eintr!(
+                        self.socket.recv_with_fds(&mut msg_json[total..], 0)
+                    ).map_err(Error::Recv)?;
+                    if n == 0 {
+                        return Err(Error::Disconnected);
+                    }
+                    total += n;
+                }
+
+                Ok((msg_json, fds))
+            } else {
+                // Linux/other SOCK_SEQPACKET: use MSG_TRUNC|MSG_PEEK for size.
+                let msg_size = handle_eintr!(
+                    self.socket.inner().next_packet_size()
+                ).map_err(Error::Recv)?;
+
+                let mut msg_json = vec![0u8; msg_size];
+                let (n, fds) = handle_eintr!(
+                    self.socket.recv_with_fds(&mut msg_json, max_fds)
+                ).map_err(Error::Recv)?;
+
+                msg_json.truncate(n);
+                Ok((msg_json, fds))
+            }
+        }
     }
 
     pub fn set_send_timeout(&self, timeout: Option<Duration>) -> Result<()> {
