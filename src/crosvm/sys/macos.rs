@@ -196,7 +196,9 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             Arch::arch_memory_layout(&components).context("failed to create arch memory layout")?;
         let guest_mem = create_guest_memory(&components, &arch_memory_layout, &hvf)?;
 
-        let vm = HvfVm::new(hvf, guest_mem)
+        // GIC distributor base address — must match aarch64::AARCH64_GIC_DIST_BASE.
+        const GIC_DIST_BASE: u64 = 0x40000000 - 0x10000; // 0x3FFF0000
+        let vm = HvfVm::new(hvf, guest_mem, GIC_DIST_BASE)
             .context("failed to create HVF VM")?;
 
         // Set up default serial parameters (COM1 = stdout console with earlycon).
@@ -265,7 +267,6 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             use devices::GicRedistributor;
 
             info!("Registering software GIC MMIO emulation (macOS <15 fallback)...");
-            const GIC_DIST_BASE: u64 = 0x3FFF0000;
             const GIC_DIST_SIZE: u64 = 0x10000;
             let gicd = GicDistributor::new(64);
             linux.mmio_bus.insert(

@@ -171,8 +171,8 @@ impl IrqChip for HvfGicChip {
             use hypervisor::hvf::ffi;
             if ffi::hvf_gic_is_available() {
                 // macOS 15+: Use native HVF GIC to inject SPI.
-                // SPI INTIDs start at 32; GSI 0 = SPI 32 in GIC terms.
-                let intid = gsi + 32;
+                // SPI INTIDs start at GIC_SPI_BASE (32); GSI 0 = INTID 32.
+                let intid = gsi + ffi::GIC_SPI_BASE;
                 // Edge-triggered: assert then deassert to create a rising edge.
                 let ret = unsafe { ffi::hv_gic_set_spi(intid, true) };
                 if ret != ffi::HV_SUCCESS {

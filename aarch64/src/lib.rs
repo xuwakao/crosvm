@@ -674,8 +674,8 @@ impl arch::LinuxArch for AArch64 {
                 .map_err(|_| Error::DowncastVcpu)?;
             // Set MPIDR_EL1 affinity for this vCPU.
             // Required by HVF's native GIC to map redistributors.
-            // MPIDR format: bit 31 = RES1, Aff0 = vcpu_id
-            let mpidr_val = (1u64 << 31) | (vcpu_id as u64);
+            // MPIDR format: bit 31 = RES1 (MPIDR_RES1), Aff0 = vcpu_id
+            let mpidr_val = hypervisor::hvf::ffi::MPIDR_RES1 | (vcpu_id as u64);
             if let Err(e) = vcpu.set_one_reg(VcpuRegAArch64::System(
                 aarch64_sys_reg::MPIDR_EL1,
             ), mpidr_val) {

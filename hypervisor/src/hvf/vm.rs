@@ -45,7 +45,9 @@ pub struct HvfVm {
 impl HvfVm {
     /// Create a new HVF VM and map all guest memory regions.
     /// The VM is already created by `Hvf::new()` (hv_vm_create).
-    pub fn new(hvf: Hvf, guest_mem: GuestMemory) -> Result<Self> {
+    /// `gic_dist_base`: Guest physical address for GIC distributor (e.g. 0x3FFF0000).
+    /// If native HVF GIC is available (macOS 15+), it will be created at this address.
+    pub fn new(hvf: Hvf, guest_mem: GuestMemory, gic_dist_base: u64) -> Result<Self> {
         let flags = ffi::HV_MEMORY_READ | ffi::HV_MEMORY_WRITE | ffi::HV_MEMORY_EXEC;
 
         // Map all guest memory regions into the HVF VM.
@@ -118,7 +120,7 @@ impl HvfVm {
             // Place GIC regions to avoid overlap.
             // Redistributor needs redist_region_size (32MB typically).
             // Put GICD at the top, GICR below with enough space.
-            let gic_dist_base: u64 = 0x3FFF0000u64 & !(dist_align as u64 - 1);
+            let gic_dist_base: u64 = gic_dist_base & !(dist_align as u64 - 1);
             let gic_redist_base: u64 = (gic_dist_base - redist_region_size as u64) & !(redist_align as u64 - 1);
             base::info!("HVF GIC: GICD@{:#x} GICR@{:#x}", gic_dist_base, gic_redist_base);
 
@@ -136,13 +138,16 @@ impl HvfVm {
                 }
                 let ret = unsafe { ffi::hv_gic_create(config) };
                 if ret != ffi::HV_SUCCESS {
-                    base::error!("hv_gic_create failed: {} (HV_BAD_ARGUMENT={})", ret, -85377021i32);
+                    base::error!("hv_gic_create failed: {} (HV_BAD_ARGUMENT={})", ret, ffi::HV_BAD_ARGUMENT);
                 } else {
                     base::info!("HVF native GIC created successfully");
 
-                    // Enable the GIC distributor (Group1 NS enable).
-                    // GICD_CTLR offset 0x0, bit 1 = EnableGrp1NS
-                    let ret = unsafe { ffi::hv_gic_set_distributor_reg(0x0000, 0x2) };
+                    // Enable the GIC distributor: write GICD_CTLR (offset 0x0000)
+                    // with EnableGrp1NS (bit 1) = 1. This allows Group 1 Non-Secure
+                    // interrupts to be forwarded to the CPU interface.
+                    const GICD_CTLR: u16 = 0x0000;
+                    const GICD_CTLR_ENABLE_GRP1_NS: u64 = 0x2;
+                    let ret = unsafe { ffi::hv_gic_set_distributor_reg(GICD_CTLR, GICD_CTLR_ENABLE_GRP1_NS) };
                     if ret != ffi::HV_SUCCESS {
                         base::warn!("hv_gic_set_distributor_reg(CTLR, EnableGrp1NS) failed: {}", ret);
                     } else {

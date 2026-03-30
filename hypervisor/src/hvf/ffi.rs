@@ -28,13 +28,21 @@ pub type hv_vcpu_config_t = *mut c_void;
 // ============================================================================
 
 pub const HV_SUCCESS: hv_return_t = 0;
-pub const HV_ERROR: hv_return_t = -1; // 0xfaf1
-pub const HV_BUSY: hv_return_t = -2;
-pub const HV_BAD_ARGUMENT: hv_return_t = -3;
-pub const HV_NO_RESOURCES: hv_return_t = -5;
-pub const HV_NO_DEVICE: hv_return_t = -6;
-pub const HV_DENIED: hv_return_t = -7;
-pub const HV_UNSUPPORTED: hv_return_t = -8;
+// Error codes from <Hypervisor/hv_error.h> — (err_common_hypervisor | code)
+pub const HV_ERROR: hv_return_t = 0xfae94001u32 as i32;        // Generic error
+pub const HV_BUSY: hv_return_t = 0xfae94002u32 as i32;         // Resource busy
+pub const HV_BAD_ARGUMENT: hv_return_t = 0xfae94003u32 as i32;  // Invalid argument
+pub const HV_NO_RESOURCES: hv_return_t = 0xfae94005u32 as i32;  // Out of resources
+pub const HV_NO_DEVICE: hv_return_t = 0xfae94006u32 as i32;     // No such device
+pub const HV_DENIED: hv_return_t = 0xfae94007u32 as i32;        // Permission denied
+pub const HV_FAULT: hv_return_t = 0xfae94008u32 as i32;         // Memory fault
+pub const HV_UNSUPPORTED: hv_return_t = 0xfae9400fu32 as i32;   // Not supported
+
+/// GIC SPI interrupt ID offset. SPIs start at INTID 32 in GIC architecture.
+pub const GIC_SPI_BASE: u32 = 32;
+
+/// MPIDR_EL1 RES1 bit (bit 31) — must be set per ARM Architecture Reference Manual.
+pub const MPIDR_RES1: u64 = 1 << 31;
 
 // ============================================================================
 // Memory permissions
