@@ -46,7 +46,15 @@ pub const SCM_MAX_FD: usize = 253;
 
 #[allow(non_snake_case)]
 const fn CMSG_ALIGN(len: usize) -> usize {
-    (len + size_of::<c_long>() - 1) & !(size_of::<c_long>() - 1)
+    // macOS/BSD uses 4-byte alignment (__DARWIN_ALIGN32), while Linux uses
+    // sizeof(c_long) alignment. On macOS aarch64, c_long is 8 bytes but
+    // cmsg alignment is 4 bytes — using c_long would produce incorrect
+    // CMSG_SPACE values, causing sendmsg EINVAL.
+    #[cfg(target_os = "macos")]
+    const ALIGN: usize = size_of::<u32>();
+    #[cfg(not(target_os = "macos"))]
+    const ALIGN: usize = size_of::<c_long>();
+    (len + ALIGN - 1) & !(ALIGN - 1)
 }
 
 #[allow(non_snake_case)]

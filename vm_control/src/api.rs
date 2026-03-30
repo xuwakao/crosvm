@@ -47,11 +47,24 @@ pub type Result<T> = std::result::Result<T, ApiClientError>;
 #[derive(Serialize, Deserialize)]
 pub struct VmMemoryClient {
     tube: Tube,
+    /// When true, ioevent registration requests are silently accepted without
+    /// sending through the tube. This is needed on macOS where kqueue-based
+    /// Event fds cannot be sent via SCM_RIGHTS. Actual ioevent signaling is
+    /// handled by calling vm.handle_io_events() in the MMIO write path.
+    #[serde(default)]
+    noop_ioevent: bool,
 }
 
 impl VmMemoryClient {
     pub fn new(tube: Tube) -> Self {
-        VmMemoryClient { tube }
+        VmMemoryClient { tube, noop_ioevent: false }
+    }
+
+    /// Create a VmMemoryClient that silently accepts ioevent registration
+    /// requests without sending them through the tube. Used on macOS where
+    /// kqueue fds cannot traverse Unix socket SCM_RIGHTS.
+    pub fn new_noop_ioevent(tube: Tube) -> Self {
+        VmMemoryClient { tube, noop_ioevent: true }
     }
 
     fn request(&self, request: &VmMemoryRequest) -> Result<VmMemoryResponse> {
@@ -153,6 +166,9 @@ impl VmMemoryClient {
 
     /// Register an eventfd with raw guest memory address.
     pub fn register_io_event(&self, event: Event, addr: u64, datamatch: Datamatch) -> Result<()> {
+        if self.noop_ioevent {
+            return Ok(());
+        }
         self.request_unit(&VmMemoryRequest::IoEventRaw(IoEventUpdateRequest {
             event,
             addr,
@@ -163,6 +179,9 @@ impl VmMemoryClient {
 
     /// Unregister an eventfd with raw guest memory address.
     pub fn unregister_io_event(&self, event: Event, addr: u64, datamatch: Datamatch) -> Result<()> {
+        if self.noop_ioevent {
+            return Ok(());
+        }
         self.request_unit(&VmMemoryRequest::IoEventRaw(IoEventUpdateRequest {
             event,
             addr,

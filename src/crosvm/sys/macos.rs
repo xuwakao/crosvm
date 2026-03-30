@@ -29,6 +29,7 @@ use base::SendTube;
 use base::Tube;
 use devices::serial_device::SerialHardware;
 use devices::BusDeviceObj;
+use devices::VirtioPciDevice;
 use hypervisor::ProtectionType;
 use hypervisor::IoOperation;
 use hypervisor::IoParams;
@@ -200,6 +201,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
 
         // GIC distributor base address — must match aarch64::AARCH64_GIC_DIST_BASE.
         const GIC_DIST_BASE: u64 = 0x40000000 - 0x10000; // 0x3FFF0000
+        let guest_mem_for_pci = guest_mem.clone();
         let vm = HvfVm::new(hvf, guest_mem, GIC_DIST_BASE)
             .context("failed to create HVF VM")?;
 
@@ -229,8 +231,63 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         let mut irq_chip = HvfGicChip::new(vcpu_count)
             .context("failed to create HVF GIC chip")?;
 
-        // No extra devices for minimal boot.
-        let devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
+        // Create virtio devices from config and wrap in VirtioPciDevice for PCI bus.
+        let mut devices: Vec<(Box<dyn BusDeviceObj>, Option<Minijail>)> = Vec::new();
+        let mut ioevent_host_tubes: Vec<Tube> = Vec::new();
+
+        // Block devices: Config.disks → DiskOption.open() → BlockAsync → VirtioPciDevice.
+        for disk in &cfg.disks {
+            use devices::virtio;
+            use vm_control::api::VmMemoryClient;
+
+            info!("Creating virtio-blk device: {}", disk.path.display());
+            let disk_image = disk.open().context("failed to open disk image")?;
+            let base_features = virtio::base_features(ProtectionType::Unprotected);
+            let block_dev = Box::new(
+                virtio::BlockAsync::new(
+                    base_features,
+                    disk_image,
+                    disk,
+                    None, // control_tube — no runtime disk control until ISS-011
+                    None, // queue_size — use default
+                    None, // num_queues — use default
+                )
+                .context("failed to create virtio-blk device")?,
+            );
+
+            // Create tube pairs for VirtioPciDevice communication.
+            // MSI-X tube: interrupt configuration between device and IRQ chip.
+            let (_msi_host_tube, msi_device_tube) =
+                Tube::pair().context("failed to create MSI tube")?;
+            // Ioevent tube: VirtioPciDevice uses this to register ioevents.
+            // On macOS, kqueue fds cannot be sent via SCM_RIGHTS (sendmsg
+            // returns EINVAL), so ioevent registration via tube will fail.
+            // We compensate by calling vm.handle_io_events() on every MMIO
+            // write in the vCPU loop (the HAXM/WHPX approach).
+            // The device-side tube still needs to exist for VirtioPciDevice
+            // construction, but the host side just needs to respond "Ok".
+            let (ioevent_host_tube, ioevent_device_tube) =
+                Tube::pair().context("failed to create ioevent tube")?;
+            ioevent_host_tubes.push(ioevent_host_tube);
+            // VM control tube: device-to-VMM control messages.
+            let (_vm_host_tube, vm_device_tube) =
+                Tube::pair().context("failed to create vm control tube")?;
+
+            let pci_dev = VirtioPciDevice::new(
+                guest_mem_for_pci.clone(),
+                block_dev,
+                msi_device_tube,
+                false, // disable_virtio_intx
+                None,  // shared_memory_vm_memory_client — not needed for block
+                VmMemoryClient::new_noop_ioevent(ioevent_device_tube),
+                vm_device_tube,
+            )
+            .context("failed to create virtio-pci block device")?;
+
+            devices.push((Box::new(pci_dev) as Box<dyn BusDeviceObj>, None));
+            info!("virtio-blk device created for {}", disk.path.display());
+        }
+
         let mut vcpu_ids: Vec<usize> = (0..vcpu_count).collect();
 
         info!("Building VM with Arch::build_vm...");
@@ -261,6 +318,23 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         .context("Arch::build_vm failed")?;
 
         info!("VM built successfully.");
+
+        // Spawn VM memory handler thread to auto-respond to ioevent registration
+        // requests from virtio devices. On macOS, kqueue fds can't be sent via
+        // SCM_RIGHTS so the device's IoEventRaw requests will fail at the sendmsg
+        // level. The handler thread intercepts requests and responds Ok — actual
+        // ioevent signaling is done via vm.handle_io_events() in the MMIO write
+        // path (the HAXM/WHPX approach).
+        let vm_memory_join = if !ioevent_host_tubes.is_empty() {
+            Some(thread::Builder::new()
+                .name("vm_memory".into())
+                .spawn(move || {
+                    vm_memory_auto_responder(ioevent_host_tubes);
+                })
+                .context("failed to spawn vm_memory handler thread")?)
+        } else {
+            None
+        };
 
         // Register GIC MMIO emulation only if native HVF GIC is NOT available.
         // On macOS 15+, hv_gic_create() handles GICD/GICR MMIO natively.
@@ -377,7 +451,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         // This ensures the vCPU runs on the same thread that created it,
         // which is required by HVF and ensures GIC redistributor binding.
         let exit_state = if let Some(vcpu) = vcpus.first_mut() {
-            match vcpu_loop(vcpu, &io_bus, &mmio_bus, &hypercall_bus, &irq_chip, &psci_exit_request) {
+            match vcpu_loop(vcpu, &linux.vm, &io_bus, &mmio_bus, &hypercall_bus, &irq_chip, &psci_exit_request) {
                 Ok(state) => {
                     info!("vCPU exited with {:?}", state);
                     state
@@ -401,6 +475,13 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         if let Err(e) = irq_handler_join.join() {
             error!("IRQ handler thread panicked: {:?}", e);
         }
+        // VM memory handler thread exits when all device-side tubes are dropped
+        // (which happens when the vCPU loop exits and devices are cleaned up).
+        if let Some(join) = vm_memory_join {
+            if let Err(e) = join.join() {
+                error!("vm_memory handler thread panicked: {:?}", e);
+            }
+        }
 
         Ok(exit_state)
     }
@@ -409,6 +490,87 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
     {
         bail!("HVF is only supported on AArch64")
     }
+}
+
+/// Auto-responder for virtio device VmMemory requests.
+///
+/// On macOS, kqueue-based Event fds cannot be sent via SCM_RIGHTS (sendmsg
+/// returns EINVAL). VirtioPciDevice tries to send IoEventRaw requests containing
+/// Event fds through the ioevent tube, which will fail at the sendmsg level.
+///
+/// This thread reads from the host side of ioevent tubes and responds Ok to all
+/// requests. Since ioevent registration can't work through tubes on macOS, actual
+/// ioevent signaling is handled by calling vm.handle_io_events() on every MMIO
+/// write in the vCPU loop — the same approach used by HAXM and WHPX backends.
+#[cfg(target_arch = "aarch64")]
+fn vm_memory_auto_responder(tubes: Vec<Tube>) {
+    use base::EventToken;
+    use base::ReadNotifier;
+    use base::WaitContext;
+    use vm_control::VmMemoryRequest;
+    use vm_control::VmMemoryResponse;
+
+    #[derive(EventToken)]
+    enum Token {
+        Tube(usize),
+    }
+
+    let wait_ctx: WaitContext<Token> = match WaitContext::new() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            error!("vm_memory: failed to create wait context: {}", e);
+            return;
+        }
+    };
+
+    for (i, tube) in tubes.iter().enumerate() {
+        if let Err(e) = wait_ctx.add(tube.get_read_notifier(), Token::Tube(i)) {
+            error!("vm_memory: failed to add tube {} to wait context: {}", i, e);
+            return;
+        }
+    }
+
+    info!("vm_memory auto-responder started: {} tube(s)", tubes.len());
+
+    loop {
+        let events = match wait_ctx.wait() {
+            Ok(v) => v,
+            Err(e) => {
+                debug!("vm_memory: wait returned: {}", e);
+                break;
+            }
+        };
+
+        if events.is_empty() {
+            break;
+        }
+
+        let mut any_readable = false;
+        for event in events.iter().filter(|e| e.is_readable) {
+            any_readable = true;
+            if let Token::Tube(idx) = event.token {
+                match tubes[idx].recv::<VmMemoryRequest>() {
+                    Ok(_request) => {
+                        // Respond Ok to all requests. Ioevent registration is handled
+                        // via vm.handle_io_events() in the MMIO write path instead.
+                        if let Err(e) = tubes[idx].send(&VmMemoryResponse::Ok) {
+                            debug!("vm_memory: failed to send response: {}", e);
+                        }
+                    }
+                    Err(e) => {
+                        debug!("vm_memory: tube {} closed: {}", idx, e);
+                        let _ = wait_ctx.delete(tubes[idx].get_read_notifier());
+                    }
+                }
+            }
+        }
+
+        if !any_readable {
+            break;
+        }
+    }
+
+    info!("vm_memory auto-responder exiting");
 }
 
 /// IRQ handler thread — polls device IRQ eventfds and routes interrupts.
@@ -512,6 +674,7 @@ fn irq_handler_thread(
 #[cfg(target_arch = "aarch64")]
 fn vcpu_loop(
     vcpu: &mut impl VcpuAArch64,
+    vm: &impl Vm,
     io_bus: &devices::Bus,
     mmio_bus: &devices::Bus,
     hypercall_bus: &devices::Bus,
@@ -535,6 +698,13 @@ fn vcpu_loop(
                             }
                             IoOperation::Write(data) => {
                                 mmio_bus.write(address, data);
+                                // Signal ioevents for this address (HAXM/WHPX approach).
+                                // On macOS, kqueue fds can't be registered via tubes,
+                                // so we trigger ioevents on every MMIO write instead.
+                                let _ = vm.handle_io_events(
+                                    hypervisor::IoEventAddress::Mmio(address),
+                                    data,
+                                );
                                 Ok(())
                             }
                         }
