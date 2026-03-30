@@ -119,10 +119,13 @@ impl HvfVcpu {
         if is_read {
             // MRS Xt, <sysreg>
             let value = self.read_sysreg_value(reg_id);
-            base::info!(
-                "  sysreg MRS X{}, S{}_{}_C{}_C{}_{} (id={:#06x}) → {:#x}",
-                rt, op0, op1, crn, crm, op2, reg_id, value
-            );
+            // Only log ICC/GIC-related registers to avoid noise
+            if (crn == 12 && crm == 12) || (crn == 4 && crm == 6) {
+                base::info!(
+                    "  sysreg MRS X{}, S{}_{}_C{}_C{}_{} (id={:#06x}) → {:#x}",
+                    rt, op0, op1, crn, crm, op2, reg_id, value
+                );
+            }
             if rt < 31 {
                 self.set_reg(ffi::HV_REG_X0 + rt, value)?;
             }
@@ -133,10 +136,12 @@ impl HvfVcpu {
             } else {
                 0 // XZR
             };
-            base::info!(
-                "  sysreg MSR S{}_{}_C{}_C{}_{} (id={:#06x}), X{} ← {:#x}",
-                op0, op1, crn, crm, op2, reg_id, rt, value
-            );
+            if (crn == 12 && crm == 12) || (crn == 4 && crm == 6) {
+                base::info!(
+                    "  sysreg MSR S{}_{}_C{}_C{}_{} (id={:#06x}), X{} ← {:#x}",
+                    op0, op1, crn, crm, op2, reg_id, rt, value
+                );
+            }
             self.write_sysreg_value(reg_id, value);
         }
         Ok(())
@@ -313,11 +318,16 @@ impl Vcpu for HvfVcpu {
             }
             ffi::HV_EXIT_REASON_CANCELED => Ok(VcpuExit::Intr),
             ffi::HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                // Virtual timer fired — unmask, set pending, and inject IRQ.
-                // PPI 27 is the standard virtual timer interrupt on ARM64.
-                self.pending_irq.set(Some(27));
+                // Virtual timer fired. On HVF, the vtimer IRQ is delivered
+                // natively — we just need to NOT mask it. The kernel's GIC
+                // driver handles acknowledgment via ICC system registers
+                // which HVF manages internally.
+                //
+                // Note: we do NOT call hv_vcpu_set_vtimer_mask(false) here
+                // because that would cause an infinite loop — the timer keeps
+                // firing immediately. Instead we leave it masked and inject
+                // the IRQ. The kernel will unmask it via ICC_EOIR1 write.
                 unsafe {
-                    ffi::hv_vcpu_set_vtimer_mask(self.vcpu, false);
                     ffi::hv_vcpu_set_pending_interrupt(
                         self.vcpu,
                         ffi::HV_INTERRUPT_TYPE_IRQ,

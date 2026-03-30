@@ -478,6 +478,10 @@ fn vcpu_loop(
                 }
                 VcpuExit::Intr => {
                     intr_count += 1;
+                    if intr_count <= 5 || intr_count % 10000 == 0 {
+                        let pc = vcpu.get_one_reg(hypervisor::VcpuRegAArch64::Pc).unwrap_or(0);
+                        info!("  Intr #{} PC={:#x}", intr_count, pc);
+                    }
                 }
                 VcpuExit::SystemEventShutdown => {
                     info!("vCPU {} system event shutdown", vcpu.id());
