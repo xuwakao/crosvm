@@ -584,8 +584,8 @@ fn vcpu_loop(
                         match operation {
                             IoOperation::Read(data) => {
                                 mmio_bus.read(address, data);
-                                // Log ALL reads with returned data
-                                if mmio_count <= 200 {
+                                // Log serial range reads
+                                if address >= 0x3f8 && address < 0x400 && mmio_count > 200 {
                                     let val = match data.len() {
                                         1 => data[0] as u64,
                                         2 => u16::from_le_bytes([data[0], data[1]]) as u64,
@@ -609,15 +609,14 @@ fn vcpu_loop(
                                         }
                                     }
                                 }
-                                if mmio_count <= 200 {
-                                    let val = match data.len() {
-                                        1 => data[0] as u64,
-                                        2 => u16::from_le_bytes([data[0], data[1]]) as u64,
-                                        4 => u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64,
-                                        8 => u64::from_le_bytes([data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7]]),
-                                        _ => 0,
-                                    };
-                                    info!("  MMIO write @ {:#x} [{}B] ← {:#x}", address, data.len(), val);
+                                // Log serial range writes always
+                                if address >= 0x3f8 && address < 0x400 && mmio_count > 200 {
+                                    let val = data[0] as u64;
+                                    if address == 0x3f8 && val >= 0x20 && val < 0x7f {
+                                        info!("  SERIAL TX: '{}'", val as u8 as char);
+                                    } else {
+                                        info!("  MMIO write @ {:#x} [{}B] ← {:#x}", address, data.len(), val);
+                                    }
                                 }
                                 mmio_bus.write(address, data);
                                 Ok(())
