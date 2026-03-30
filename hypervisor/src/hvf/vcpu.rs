@@ -92,6 +92,11 @@ impl HvfVcpu {
         hvf_result(ret)
     }
 
+    /// Get the raw HVF vCPU handle for interrupt injection.
+    pub fn hvf_handle(&self) -> ffi::hv_vcpu_t {
+        self.vcpu
+    }
+
     /// Read a system register.
     fn get_sys_reg(&self, reg: ffi::hv_sys_reg_t) -> Result<u64> {
         let mut val: u64 = 0;
