@@ -328,8 +328,41 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         let vcpu_init_data = linux.vcpu_init.clone();
         let vm_for_vcpus = linux.vm.try_clone().context("failed to clone vm")?;
 
-        // Drop the vCPUs created by build_vm (they were created on the wrong thread for HVF).
-        drop(linux.vcpus.take());
+        // Keep the main-thread vCPUs alive — their GIC redistributor associations
+        // must persist until the thread vCPUs are created.
+        let main_thread_vcpus = linux.vcpus.take();
+
+        // Debug: check redistributor base for each vCPU
+        if let Some(ref vcpus) = main_thread_vcpus {
+            for vcpu in vcpus.iter() {
+                // Read MPIDR via HVF sys_reg API directly
+                let mut mpidr: u64 = 0;
+                let ret = unsafe {
+                    hypervisor::hvf::ffi::hv_vcpu_get_sys_reg(
+                        vcpu.hvf_handle(),
+                        hypervisor::hvf::ffi::HV_SYS_REG_MPIDR_EL1,
+                        &mut mpidr,
+                    )
+                };
+                info!("vCPU {} MPIDR={:#x} (ret={})", vcpu.id(), mpidr, ret);
+
+                // Query redistributor base via HVF
+                if hypervisor::hvf::ffi::hvf_gic_is_available() {
+                    type GetRedistBaseFn = unsafe extern "C" fn(u64, *mut u64) -> i32;
+                    let func: Option<GetRedistBaseFn> = unsafe {
+                        let sym = libc::dlsym(libc::RTLD_DEFAULT,
+                            b"hv_gic_get_redistributor_base\0".as_ptr() as *const _);
+                        if sym.is_null() { None } else { Some(std::mem::transmute(sym)) }
+                    };
+                    if let Some(f) = func {
+                        let mut redist_base: u64 = 0;
+                        let ret = unsafe { f(vcpu.hvf_handle(), &mut redist_base) };
+                        info!("  hv_gic_get_redistributor_base: ret={} base={:#x}", ret, redist_base);
+                    }
+                }
+            }
+        }
+        let _main_thread_vcpus = main_thread_vcpus;
 
         let io_bus = linux.io_bus.clone();
         let mmio_bus = linux.mmio_bus.clone();
@@ -496,6 +529,7 @@ fn irq_handler_thread(
                     }
                 }
                 Token::IrqFd { index } => {
+                    info!("IRQ event {} fired!", index);
                     if let Err(e) = irq_chip_mut.service_irq_event(index) {
                         error!("failed to service IRQ event {}: {}", index, e);
                     }

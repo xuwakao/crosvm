@@ -42,12 +42,11 @@ struct IrqEvent {
 /// GIC distributor/redistributor register access via system register traps.
 pub struct HvfGicChip {
     num_vcpus: usize,
-    irq_events: Vec<IrqEvent>,
+    // Shared IRQ event list — accessible from IRQ handler thread via clone.
+    irq_events: Arc<Mutex<Vec<IrqEvent>>>,
     // Track which IRQs are pending (one bool per GSI).
-    // When a device signals an event, the corresponding IRQ becomes pending.
     pending_irqs: Arc<Mutex<Vec<bool>>>,
     // HVF vCPU handles for cross-thread interrupt injection.
-    // Set by the vCPU thread via set_vcpu_handle().
     vcpu_handles: Arc<Mutex<Vec<u64>>>,
 }
 
@@ -58,7 +57,7 @@ impl HvfGicChip {
     pub fn new(num_vcpus: usize) -> Result<Self> {
         Ok(HvfGicChip {
             num_vcpus,
-            irq_events: Vec::new(),
+            irq_events: Arc::new(Mutex::new(Vec::new())),
             pending_irqs: Arc::new(Mutex::new(vec![false; MAX_IRQS])),
             vcpu_handles: Arc::new(Mutex::new(Vec::new())),
         })
@@ -88,8 +87,9 @@ impl IrqChip for HvfGicChip {
         irq_event: &IrqEdgeEvent,
         source: IrqEventSource,
     ) -> Result<Option<IrqEventIndex>> {
-        let index = self.irq_events.len();
-        self.irq_events.push(IrqEvent {
+        let mut events = self.irq_events.lock();
+        let index = events.len();
+        events.push(IrqEvent {
             gsi: irq,
             trigger_event: irq_event.get_trigger().try_clone()?,
             source,
@@ -98,7 +98,7 @@ impl IrqChip for HvfGicChip {
     }
 
     fn unregister_edge_irq_event(&mut self, irq: u32, _irq_event: &IrqEdgeEvent) -> Result<()> {
-        self.irq_events.retain(|e| e.gsi != irq);
+        self.irq_events.lock().retain(|e| e.gsi != irq);
         Ok(())
     }
 
@@ -108,8 +108,9 @@ impl IrqChip for HvfGicChip {
         irq_event: &IrqLevelEvent,
         source: IrqEventSource,
     ) -> Result<Option<IrqEventIndex>> {
-        let index = self.irq_events.len();
-        self.irq_events.push(IrqEvent {
+        let mut events = self.irq_events.lock();
+        let index = events.len();
+        events.push(IrqEvent {
             gsi: irq,
             trigger_event: irq_event.get_trigger().try_clone()?,
             source,
@@ -122,7 +123,7 @@ impl IrqChip for HvfGicChip {
         irq: u32,
         _irq_event: &IrqLevelEvent,
     ) -> Result<()> {
-        self.irq_events.retain(|e| e.gsi != irq);
+        self.irq_events.lock().retain(|e| e.gsi != irq);
         Ok(())
     }
 
@@ -137,6 +138,7 @@ impl IrqChip for HvfGicChip {
 
     fn irq_event_tokens(&self) -> Result<Vec<(IrqEventIndex, IrqEventSource, Event)>> {
         self.irq_events
+            .lock()
             .iter()
             .enumerate()
             .map(|(i, e)| Ok((i, e.source.clone(), e.trigger_event.try_clone()?)))
@@ -152,7 +154,9 @@ impl IrqChip for HvfGicChip {
     }
 
     fn service_irq_event(&mut self, event_index: IrqEventIndex) -> Result<()> {
-        if let Some(irq_event) = self.irq_events.get(event_index) {
+        let events = self.irq_events.lock();
+        if let Some(irq_event) = events.get(event_index) {
+            base::info!("service_irq_event: index={} gsi={} source={}", event_index, irq_event.gsi, irq_event.source.device_name);
             let gsi = irq_event.gsi;
             // Clear the event (edge-triggered: auto-deassert).
             let _ = irq_event.trigger_event.wait();
@@ -173,6 +177,8 @@ impl IrqChip for HvfGicChip {
                 let ret = unsafe { ffi::hv_gic_set_spi(intid, true) };
                 if ret != ffi::HV_SUCCESS {
                     base::error!("hv_gic_set_spi({}) failed: {}", intid, ret);
+                } else {
+                    base::info!("hv_gic_set_spi({}) OK", intid);
                 }
             } else {
                 // macOS <15: Fallback — inject physical IRQ signal to all vCPUs.
@@ -267,7 +273,7 @@ impl IrqChip for HvfGicChip {
     {
         Ok(HvfGicChip {
             num_vcpus: self.num_vcpus,
-            irq_events: Vec::new(), // Events are not cloned — only the main instance handles events
+            irq_events: Arc::clone(&self.irq_events),
             pending_irqs: Arc::clone(&self.pending_irqs),
             vcpu_handles: Arc::clone(&self.vcpu_handles),
         })
