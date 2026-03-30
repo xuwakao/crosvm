@@ -7,6 +7,8 @@ pub mod config;
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread;
 
@@ -343,6 +345,24 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             .context("failed to configure vcpu")?;
         }
 
+        // Register PSCI device on the hypercall bus.
+        // On HVF, PSCI calls arrive as userspace hypercalls (unlike KVM where
+        // the kernel handles them natively). The PsciDevice handles all PSCI 1.0
+        // calls and signals SYSTEM_OFF/RESET via a shared atomic flag.
+        let psci_exit_request = Arc::new(AtomicU8::new(devices::PSCI_EXIT_NONE));
+        let psci_device = Arc::new(devices::PsciDevice::new(psci_exit_request.clone()));
+        for fid_range in [
+            devices::PsciDevice::HVC32_FID_RANGE,
+            devices::PsciDevice::HVC64_FID_RANGE,
+        ] {
+            let base: u64 = fid_range.start.into();
+            let count = fid_range.len();
+            linux
+                .hypercall_bus
+                .insert_sync(psci_device.clone(), base, count.try_into().unwrap())
+                .expect("failed to register PSCI device on hypercall bus");
+        }
+
         let io_bus = linux.io_bus.clone();
         let mmio_bus = linux.mmio_bus.clone();
         let hypercall_bus = linux.hypercall_bus.clone();
@@ -357,7 +377,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         // This ensures the vCPU runs on the same thread that created it,
         // which is required by HVF and ensures GIC redistributor binding.
         let exit_state = if let Some(vcpu) = vcpus.first_mut() {
-            match vcpu_loop(vcpu, &io_bus, &mmio_bus, &hypercall_bus, &irq_chip) {
+            match vcpu_loop(vcpu, &io_bus, &mmio_bus, &hypercall_bus, &irq_chip, &psci_exit_request) {
                 Ok(state) => {
                     info!("vCPU exited with {:?}", state);
                     state
@@ -496,6 +516,7 @@ fn vcpu_loop(
     mmio_bus: &devices::Bus,
     hypercall_bus: &devices::Bus,
     irq_chip: &devices::HvfGicChip,
+    psci_exit_request: &Arc<AtomicU8>,
 ) -> Result<ExitState> {
     use devices::IrqChip;
 
@@ -529,43 +550,18 @@ fn vcpu_loop(
                 VcpuExit::SystemEventReset => return Ok(ExitState::Reset),
                 VcpuExit::SystemEventCrash => return Ok(ExitState::Crash),
                 VcpuExit::Hypercall => {
-                    // PSCI calls handled inline; others dispatch to hypercall bus.
-                    // TODO(ISS-010): Move PSCI to a proper hypercall bus device.
+                    // All hypercalls (including PSCI) route through the bus.
+                    // PsciDevice handles PSCI calls; other devices handle their ranges.
                     if let Err(e) = vcpu.handle_hypercall(&mut |abi| {
-                        let fid = abi.hypercall_id();
-                        match fid {
-                            0x84000000 => { // PSCI_VERSION → 1.0
-                                abi.set_results(&[0x10000, 0, 0, 0]);
-                                Ok(())
-                            }
-                            0x84000006 => { // PSCI_MIGRATE_INFO_TYPE → TOS_NOT_PRESENT_MP
-                                abi.set_results(&[2, 0, 0, 0]);
-                                Ok(())
-                            }
-                            0x8400000a => { // PSCI_FEATURES
-                                let feature_id = abi.get_argument(0).copied().unwrap_or(0);
-                                let supported = matches!(feature_id,
-                                    0x84000000 | 0x84000001 | 0x84000002 | 0xc4000003 |
-                                    0x84000008 | 0x84000009);
-                                abi.set_results(&[if supported { 0 } else { u64::MAX as usize }, 0, 0, 0]);
-                                Ok(())
-                            }
-                            0x84000002 | 0xc4000003 => { // PSCI_CPU_OFF / CPU_ON
-                                abi.set_results(&[0, 0, 0, 0]);
-                                Ok(())
-                            }
-                            0x84000008 => { // PSCI_SYSTEM_OFF
-                                abi.set_results(&[0, 0, 0, 0]);
-                                Ok(())
-                            }
-                            0x84000009 => { // PSCI_SYSTEM_RESET
-                                abi.set_results(&[0, 0, 0, 0]);
-                                Ok(())
-                            }
-                            _ => hypercall_bus.handle_hypercall(abi),
-                        }
+                        hypercall_bus.handle_hypercall(abi)
                     }) {
                         error!("hypercall error: {}", e);
+                    }
+                    // Check if PSCI requested VM exit (SYSTEM_OFF or SYSTEM_RESET).
+                    match psci_exit_request.load(Ordering::Acquire) {
+                        devices::PSCI_EXIT_SHUTDOWN => return Ok(ExitState::Stop),
+                        devices::PSCI_EXIT_RESET => return Ok(ExitState::Reset),
+                        _ => {}
                     }
                 }
                 _ => {} // Ignore other exits

@@ -31,6 +31,7 @@ pub enum PlatformDeviceId {
     FwCfg = 23,
     SmcccTrng = 24,
     HvcDevicePowerManager = 25,
+    Psci = 26,
     Mock = 0xff,
 }
 

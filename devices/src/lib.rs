@@ -23,6 +23,8 @@ mod mock;
 mod pci;
 mod pflash;
 pub mod pl030;
+#[cfg(target_os = "macos")]
+mod psci;
 pub mod pmc_virt;
 mod power;
 mod serial;
@@ -135,6 +137,14 @@ pub use self::serial_device::SerialHardware;
 pub use self::serial_device::SerialParameters;
 pub use self::serial_device::SerialType;
 pub use self::smccc_trng::SmcccTrng;
+#[cfg(target_os = "macos")]
+pub use self::psci::PsciDevice;
+#[cfg(target_os = "macos")]
+pub use self::psci::PSCI_EXIT_NONE;
+#[cfg(target_os = "macos")]
+pub use self::psci::PSCI_EXIT_RESET;
+#[cfg(target_os = "macos")]
+pub use self::psci::PSCI_EXIT_SHUTDOWN;
 pub use self::suspendable::DeviceState;
 pub use self::suspendable::Suspendable;
 #[cfg(any(target_os = "android", target_os = "linux"))]
