@@ -21,6 +21,7 @@ pub mod ioctl_macros;
 pub(in crate::sys::macos) mod kqueue;
 pub(crate) mod mmap;
 mod net;
+pub mod terminal;
 mod timer;
 
 pub(crate) use event::PlatformEvent;

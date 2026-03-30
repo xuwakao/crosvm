@@ -347,6 +347,12 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         let mmio_bus = linux.mmio_bus.clone();
         let hypercall_bus = linux.hypercall_bus.clone();
 
+        // Set stdin to raw mode so keypresses are delivered immediately
+        use base::macos::terminal::Terminal;
+        // without line buffering. This enables interactive console in the VM.
+        // Restored to canonical mode after the vCPU loop exits.
+        let _ = std::io::stdin().set_raw_mode();
+
         // Run the vCPU loop on the main thread (single vCPU).
         // This ensures the vCPU runs on the same thread that created it,
         // which is required by HVF and ensures GIC redistributor binding.
@@ -364,6 +370,9 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         } else {
             ExitState::Stop
         };
+
+        // Restore stdin to canonical mode.
+        let _ = std::io::stdin().set_canon_mode();
 
         // Shut down IRQ handler thread.
         if let Err(e) = irq_handler_control.send(&vm_control::IrqHandlerRequest::Exit) {
