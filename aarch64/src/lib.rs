@@ -664,42 +664,71 @@ impl arch::LinuxArch for AArch64 {
         use_pmu &= !no_pmu;
         let vcpu_count = components.vcpu_count;
         let mut has_pvtime = true;
+
+        // On macOS HVF, vCPUs have thread affinity: hv_vcpu_create and hv_vcpu_run
+        // must be called from the same thread. For multi-vCPU support, each vCPU must
+        // be created on its own worker thread, not on the main thread.
+        // When skip_vcpu_creation is true, build_vm returns vcpus=None and the caller
+        // is responsible for creating vCPUs on per-thread workers.
+        #[cfg(target_os = "macos")]
+        let skip_vcpu_creation = true;
+        #[cfg(not(target_os = "macos"))]
+        let skip_vcpu_creation = false;
+
         let mut vcpus = Vec::with_capacity(vcpu_count);
         let mut vcpu_init = Vec::with_capacity(vcpu_count);
-        for vcpu_id in 0..vcpu_count {
-            let vcpu: Vcpu = *vm
-                .create_vcpu(vcpu_id)
-                .map_err(Error::CreateVcpu)?
-                .downcast::<Vcpu>()
-                .map_err(|_| Error::DowncastVcpu)?;
-            // Set MPIDR_EL1 affinity for this vCPU.
-            // Required by HVF's native GIC to map redistributors.
-            // MPIDR format: bit 31 = RES1 (MPIDR_RES1), Aff0 = vcpu_id
-            let mpidr_val = hypervisor::hvf::ffi::MPIDR_RES1 | (vcpu_id as u64);
-            if let Err(e) = vcpu.set_one_reg(VcpuRegAArch64::System(
-                aarch64_sys_reg::MPIDR_EL1,
-            ), mpidr_val) {
-                base::warn!("Failed to set MPIDR_EL1 for vCPU {}: {}", vcpu_id, e);
-            }
-            let per_vcpu_init = if vm
-                .get_hypervisor()
-                .check_capability(HypervisorCap::HypervisorInitializedBootContext)
-            {
-                // No registers are initialized: VcpuInitAArch64.regs is an empty BTreeMap
-                Default::default()
-            } else {
-                Self::vcpu_init(
+
+        if skip_vcpu_creation {
+            // macOS: skip vCPU creation. Prepare init data for each vCPU
+            // so worker threads can configure them after creation.
+            for vcpu_id in 0..vcpu_count {
+                let per_vcpu_init = Self::vcpu_init(
                     vcpu_id,
                     &payload,
                     fdt_address,
                     components.hv_cfg.protection_type,
                     components.boot_cpu,
-                )
-            };
-            has_pvtime &= vcpu.has_pvtime_support();
-            vcpus.push(vcpu);
-            vcpu_ids.push(vcpu_id);
-            vcpu_init.push(per_vcpu_init);
+                );
+                vcpu_ids.push(vcpu_id);
+                vcpu_init.push(per_vcpu_init);
+            }
+            has_pvtime = false; // pvtime not checked without vCPU objects
+        } else {
+            // Linux/other: create all vCPUs on main thread (original path).
+            for vcpu_id in 0..vcpu_count {
+                let vcpu: Vcpu = *vm
+                    .create_vcpu(vcpu_id)
+                    .map_err(Error::CreateVcpu)?
+                    .downcast::<Vcpu>()
+                    .map_err(|_| Error::DowncastVcpu)?;
+                #[cfg(target_os = "macos")]
+                {
+                    let mpidr_val = hypervisor::hvf::ffi::MPIDR_RES1 | (vcpu_id as u64);
+                    if let Err(e) = vcpu.set_one_reg(VcpuRegAArch64::System(
+                        aarch64_sys_reg::MPIDR_EL1,
+                    ), mpidr_val) {
+                        base::warn!("Failed to set MPIDR_EL1 for vCPU {}: {}", vcpu_id, e);
+                    }
+                }
+                let per_vcpu_init = if vm
+                    .get_hypervisor()
+                    .check_capability(HypervisorCap::HypervisorInitializedBootContext)
+                {
+                    Default::default()
+                } else {
+                    Self::vcpu_init(
+                        vcpu_id,
+                        &payload,
+                        fdt_address,
+                        components.hv_cfg.protection_type,
+                        components.boot_cpu,
+                    )
+                };
+                has_pvtime &= vcpu.has_pvtime_support();
+                vcpus.push(vcpu);
+                vcpu_ids.push(vcpu_id);
+                vcpu_init.push(per_vcpu_init);
+            }
         }
 
         let enable_sve = if components.sve_config.auto {
@@ -708,10 +737,12 @@ impl arch::LinuxArch for AArch64 {
             false
         };
 
-        // Initialize Vcpus after all Vcpu objects have been created.
-        for (vcpu_id, vcpu) in vcpus.iter().enumerate() {
-            let features = &Self::vcpu_features(vcpu_id, use_pmu, components.boot_cpu, enable_sve);
-            vcpu.init(features).map_err(Error::VcpuInit)?;
+        if !skip_vcpu_creation {
+            // Initialize Vcpus after all Vcpu objects have been created.
+            for (vcpu_id, vcpu) in vcpus.iter().enumerate() {
+                let features = &Self::vcpu_features(vcpu_id, use_pmu, components.boot_cpu, enable_sve);
+                vcpu.init(features).map_err(Error::VcpuInit)?;
+            }
         }
 
         irq_chip.finalize().map_err(Error::FinalizeIrqChip)?;
@@ -966,7 +997,12 @@ impl arch::LinuxArch for AArch64 {
                 .map_err(Error::Cmdline)?;
         }
 
-        let psci_version = vcpus[0].get_psci_version().map_err(Error::GetPsciVersion)?;
+        let psci_version = if !vcpus.is_empty() {
+            vcpus[0].get_psci_version().map_err(Error::GetPsciVersion)?
+        } else {
+            // macOS: vCPUs not created yet. Return PSCI 1.0 (our PsciDevice emulates this).
+            hypervisor::PsciVersion { major: 1, minor: 0 }
+        };
 
         let pci_cfg = fdt::PciConfigRegion {
             base: arch_memory_layout.pci_cam.start,
@@ -1055,7 +1091,17 @@ impl arch::LinuxArch for AArch64 {
             #[cfg(any(target_os = "android", target_os = "linux"))]
             dev_resources,
             vcpu_count as u32,
-            &|n| get_vcpu_mpidr_aff(&vcpus, n),
+            &|n| {
+                if vcpus.is_empty() {
+                    // macOS: vCPUs not created yet. Compute MPIDR from vcpu_id.
+                    // MPIDR_RES1 (bit 31) | Aff0 = vcpu_id. Mask with AFF_MASK.
+                    const MPIDR_RES1: u64 = 1 << 31;
+                    const MPIDR_AFF_MASK: u64 = 0xff_00ff_ffff;
+                    Some((MPIDR_RES1 | n as u64) & MPIDR_AFF_MASK)
+                } else {
+                    get_vcpu_mpidr_aff(&vcpus, n)
+                }
+            },
             components.cpu_clusters,
             components.cpu_capacity,
             #[cfg(any(target_os = "android", target_os = "linux"))]
@@ -1103,7 +1149,7 @@ impl arch::LinuxArch for AArch64 {
         Ok(RunnableLinuxVm {
             vm,
             vcpu_count,
-            vcpus: Some(vcpus),
+            vcpus: if vcpus.is_empty() { None } else { Some(vcpus) },
             vcpu_init,
             vcpu_affinity: components.vcpu_affinity,
             no_smt: components.no_smt,

@@ -80,9 +80,12 @@ impl HvfGicChip {
 }
 
 impl IrqChip for HvfGicChip {
-    fn add_vcpu(&mut self, _vcpu_id: usize, _vcpu: &dyn Vcpu) -> Result<()> {
-        // HVF vCPU handles are obtained via downcast in inject_interrupts.
-        // We just track the count.
+    fn add_vcpu(&mut self, vcpu_id: usize, vcpu: &dyn Vcpu) -> Result<()> {
+        // Extract the HVF vCPU handle for cross-thread interrupt injection.
+        use hypervisor::hvf::vcpu::HvfVcpu;
+        if let Some(hvf_vcpu) = vcpu.downcast_ref::<HvfVcpu>() {
+            self.set_vcpu_handle(vcpu_id, hvf_vcpu.hvf_handle());
+        }
         Ok(())
     }
 

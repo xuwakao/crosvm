@@ -58,8 +58,12 @@ pub const PSCI_EXIT_RESET: u8 = 2;
 /// Registers on the hypercall bus for PSCI function ID ranges. When the guest
 /// calls PSCI_SYSTEM_OFF or PSCI_SYSTEM_RESET, the device sets `exit_request`
 /// which the vCPU loop checks to terminate.
+/// Callback for PSCI CPU_ON: (target_cpu_mpidr, entry_point, context_id) -> success.
+pub type CpuOnCallback = Arc<dyn Fn(u64, u64, u64) -> bool + Send + Sync>;
+
 pub struct PsciDevice {
     exit_request: Arc<AtomicU8>,
+    cpu_on_callback: Option<CpuOnCallback>,
 }
 
 impl PsciDevice {
@@ -69,7 +73,12 @@ impl PsciDevice {
     pub const HVC64_FID_RANGE: Range<u32> = 0xC400_0000..0xC400_0010;
 
     pub fn new(exit_request: Arc<AtomicU8>) -> Self {
-        Self { exit_request }
+        Self { exit_request, cpu_on_callback: None }
+    }
+
+    pub fn with_cpu_on_callback(mut self, cb: CpuOnCallback) -> Self {
+        self.cpu_on_callback = Some(cb);
+        self
     }
 
     /// Returns the PSCI_NOT_SUPPORTED value sign-extended to usize.
@@ -102,6 +111,8 @@ impl BusDevice for PsciDevice {
                 let supported = matches!(
                     feature_id,
                     PSCI_VERSION
+                        | PSCI_CPU_ON_32
+                        | PSCI_CPU_ON_64
                         | PSCI_CPU_OFF
                         | PSCI_SYSTEM_OFF
                         | PSCI_SYSTEM_RESET
@@ -119,8 +130,18 @@ impl BusDevice for PsciDevice {
                 [PSCI_SUCCESS as usize, 0, 0, 0]
             }
             PSCI_CPU_ON_32 | PSCI_CPU_ON_64 => {
-                // Secondary CPU start not supported (single-vCPU limitation).
-                [Self::not_supported(), 0, 0, 0]
+                let target_cpu = *abi.get_argument(0).unwrap_or(&0) as u64;
+                let entry_point = *abi.get_argument(1).unwrap_or(&0) as u64;
+                let context_id = *abi.get_argument(2).unwrap_or(&0) as u64;
+                if let Some(ref cb) = self.cpu_on_callback {
+                    if cb(target_cpu, entry_point, context_id) {
+                        [PSCI_SUCCESS as usize, 0, 0, 0]
+                    } else {
+                        [Self::not_supported(), 0, 0, 0]
+                    }
+                } else {
+                    [Self::not_supported(), 0, 0, 0]
+                }
             }
             PSCI_CPU_SUSPEND_32 | PSCI_CPU_SUSPEND_64 => {
                 [Self::not_supported(), 0, 0, 0]

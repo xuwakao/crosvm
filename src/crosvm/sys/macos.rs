@@ -398,39 +398,34 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             })
             .context("failed to spawn IRQ handler thread")?;
 
-        // Use the vCPUs created by build_vm directly on the main thread.
-        // HVF requires vCPUs to be used from the thread that created them,
-        // and the native GIC binds redistributors to these vCPUs.
-        // For single-vCPU VMs, we run the vCPU loop on the main thread.
-        let mut vcpus = linux.vcpus.take().context("no vcpus created by build_vm")?;
-
-        // Register vCPU handles for cross-thread IRQ injection.
-        for vcpu in vcpus.iter() {
-            irq_chip.set_vcpu_handle(vcpu.id(), vcpu.hvf_handle());
-        }
-
-        // Configure vCPUs with arch-specific init registers.
-        let vcpu_init_data = linux.vcpu_init.clone();
-        for (vcpu_id, vcpu) in vcpus.iter_mut().enumerate() {
-            Arch::configure_vcpu(
-                &linux.vm,
-                linux.vm.get_hypervisor(),
-                &mut irq_chip,
-                vcpu,
-                vcpu_init_data[vcpu_id].clone(),
-                vcpu_id,
-                vcpu_count,
-                None,
-            )
-            .context("failed to configure vcpu")?;
-        }
+        // Per-vCPU startup signal for PSCI CPU_ON.
+        // Secondary vCPUs wait until CPU_ON sets their (entry_point, context_id).
+        let vcpu_start_signals: Vec<Arc<(std::sync::Mutex<Option<(u64, u64)>>, std::sync::Condvar)>> =
+            (0..vcpu_count)
+                .map(|_| Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new())))
+                .collect();
 
         // Register PSCI device on the hypercall bus.
-        // On HVF, PSCI calls arrive as userspace hypercalls (unlike KVM where
-        // the kernel handles them natively). The PsciDevice handles all PSCI 1.0
-        // calls and signals SYSTEM_OFF/RESET via a shared atomic flag.
         let psci_exit_request = Arc::new(AtomicU8::new(devices::PSCI_EXIT_NONE));
-        let psci_device = Arc::new(devices::PsciDevice::new(psci_exit_request.clone()));
+        // PSCI CPU_ON callback: signal the target secondary vCPU to start.
+        let start_signals_for_psci = vcpu_start_signals.clone();
+        let cpu_on_cb: devices::CpuOnCallback = Arc::new(move |target_mpidr, entry_point, context_id| {
+            // target_mpidr Aff0 field = vcpu_id (we set MPIDR = RES1 | vcpu_id).
+            let target_id = (target_mpidr & 0xff) as usize;
+            if let Some(signal) = start_signals_for_psci.get(target_id) {
+                let (lock, cvar) = &**signal;
+                let mut started = lock.lock().unwrap();
+                *started = Some((entry_point, context_id));
+                cvar.notify_one();
+                true
+            } else {
+                false
+            }
+        });
+        let psci_device = Arc::new(
+            devices::PsciDevice::new(psci_exit_request.clone())
+                .with_cpu_on_callback(cpu_on_cb),
+        );
         for fid_range in [
             devices::PsciDevice::HVC32_FID_RANGE,
             devices::PsciDevice::HVC64_FID_RANGE,
@@ -446,30 +441,130 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         let io_bus = linux.io_bus.clone();
         let mmio_bus = linux.mmio_bus.clone();
         let hypercall_bus = linux.hypercall_bus.clone();
+        let vcpu_init_data = linux.vcpu_init.clone();
 
-        // Set stdin to raw mode so keypresses are delivered immediately
+        // Set stdin to raw mode for interactive console.
         use base::macos::terminal::Terminal;
-        // without line buffering. This enables interactive console in the VM.
-        // Restored to canonical mode after the vCPU loop exits.
         let _ = std::io::stdin().set_raw_mode();
 
-        // Run the vCPU loop on the main thread (single vCPU).
-        // This ensures the vCPU runs on the same thread that created it,
-        // which is required by HVF and ensures GIC redistributor binding.
-        let exit_state = if let Some(vcpu) = vcpus.first_mut() {
-            match vcpu_loop(vcpu, &linux.vm, &io_bus, &mmio_bus, &hypercall_bus, &irq_chip, &psci_exit_request) {
+        // Spawn per-vCPU worker threads.
+        let mut vcpu_handles: Vec<thread::JoinHandle<ExitState>> = Vec::new();
+
+        for vcpu_id in 0..vcpu_count {
+            let vm_clone = linux.vm.try_clone()
+                .context("failed to clone VM for vCPU thread")?;
+            let io_bus = io_bus.clone();
+            let mmio_bus = mmio_bus.clone();
+            let hypercall_bus = hypercall_bus.clone();
+            let mut irq_chip_clone = irq_chip.try_box_clone()
+                .context("failed to clone irq chip for vCPU thread")?;
+            let psci_exit = psci_exit_request.clone();
+            let init_data = vcpu_init_data[vcpu_id].clone();
+            let start_signal = vcpu_start_signals[vcpu_id].clone();
+
+            let handle = thread::Builder::new()
+                .name(format!("crosvm_vcpu{}", vcpu_id))
+                .spawn(move || {
+                    // Create HVF vCPU on this thread (thread affinity).
+                    let mut vcpu = match vm_clone.create_vcpu(vcpu_id) {
+                        Ok(v) => *v.downcast::<hypervisor::hvf::vcpu::HvfVcpu>()
+                            .map_err(|_| ()).expect("downcast to HvfVcpu"),
+                        Err(e) => {
+                            error!("vCPU {} creation failed: {}", vcpu_id, e);
+                            return ExitState::Crash;
+                        }
+                    };
+
+                    // Set MPIDR_EL1 for GIC redistributor binding.
+                    let mpidr_val = hypervisor::hvf::ffi::MPIDR_RES1 | (vcpu_id as u64);
+                    if let Err(e) = vcpu.set_one_reg(
+                        hypervisor::VcpuRegAArch64::System(aarch64_sys_reg::MPIDR_EL1),
+                        mpidr_val,
+                    ) {
+                        error!("vCPU {} MPIDR set failed: {}", vcpu_id, e);
+                    }
+
+                    // Initialize vCPU with empty feature set (HVF handles
+                    // features natively via the hardware).
+                    if let Err(e) = vcpu.init(&[]) {
+                        error!("vCPU {} init failed: {}", vcpu_id, e);
+                        return ExitState::Crash;
+                    }
+
+                    // Configure arch-specific registers (entry point, etc).
+                    if let Err(e) = Arch::configure_vcpu(
+                        &vm_clone,
+                        vm_clone.get_hypervisor(),
+                        &mut *irq_chip_clone.try_box_clone().expect("irq chip clone"),
+                        &mut vcpu,
+                        init_data,
+                        vcpu_id,
+                        vcpu_count,
+                        None,
+                    ) {
+                        error!("vCPU {} configure failed: {}", vcpu_id, e);
+                        return ExitState::Crash;
+                    }
+
+                    // Register vCPU with IRQ chip for cross-thread interrupt injection.
+                    irq_chip_clone.as_irq_chip_mut().add_vcpu(vcpu_id, &vcpu as &dyn Vcpu)
+                        .expect("failed to add vcpu to irq chip");
+
+                    info!("vCPU {} created on thread {:?}", vcpu_id, thread::current().id());
+
+                    // Secondary vCPUs wait for PSCI CPU_ON signal before running.
+                    // CPU 0 (boot CPU) starts immediately.
+                    if vcpu_id > 0 {
+                        let (lock, cvar) = &*start_signal;
+                        let mut guard = lock.lock().unwrap();
+                        while guard.is_none() {
+                            guard = cvar.wait(guard).unwrap();
+                        }
+                        let (entry_point, context_id) = guard.unwrap();
+                        info!("vCPU {} woken by PSCI CPU_ON: entry={:#x} ctx={:#x}", vcpu_id, entry_point, context_id);
+                        // Set entry point (PC) and context (X0) for the secondary CPU.
+                        if let Err(e) = vcpu.set_one_reg(hypervisor::VcpuRegAArch64::X(0), context_id) {
+                            error!("vCPU {} set X0 failed: {}", vcpu_id, e);
+                        }
+                        if let Err(e) = vcpu.set_one_reg(hypervisor::VcpuRegAArch64::Pc, entry_point) {
+                            error!("vCPU {} set PC failed: {}", vcpu_id, e);
+                        }
+                    }
+
+                    // Run the vCPU loop.
+                    match vcpu_loop(&mut vcpu, &vm_clone, &io_bus, &mmio_bus, &hypercall_bus, irq_chip_clone.as_ref(), &psci_exit) {
+                        Ok(state) => {
+                            info!("vCPU {} exited with {:?}", vcpu_id, state);
+                            state
+                        }
+                        Err(e) => {
+                            error!("vCPU {} error: {:#}", vcpu_id, e);
+                            ExitState::Crash
+                        }
+                    }
+                })
+                .context(format!("failed to spawn vCPU {} thread", vcpu_id))?;
+
+            vcpu_handles.push(handle);
+        }
+
+        // Wait for all vCPU threads to exit.
+        let mut exit_state = ExitState::Stop;
+        for handle in vcpu_handles {
+            match handle.join() {
                 Ok(state) => {
-                    info!("vCPU exited with {:?}", state);
-                    state
+                    if matches!(state, ExitState::Crash) {
+                        exit_state = ExitState::Crash;
+                    } else if exit_state != ExitState::Crash {
+                        exit_state = state;
+                    }
                 }
-                Err(e) => {
-                    error!("vCPU error: {:#}", e);
-                    ExitState::Crash
+                Err(_) => {
+                    error!("vCPU thread panicked");
+                    exit_state = ExitState::Crash;
                 }
             }
-        } else {
-            ExitState::Stop
-        };
+        }
 
         // Restore stdin to canonical mode.
         let _ = std::io::stdin().set_canon_mode();
@@ -670,10 +765,11 @@ fn vcpu_loop(
     io_bus: &devices::Bus,
     mmio_bus: &devices::Bus,
     hypercall_bus: &devices::Bus,
-    irq_chip: &devices::HvfGicChip,
+    irq_chip: &dyn devices::IrqChipAArch64,
     psci_exit_request: &Arc<AtomicU8>,
 ) -> Result<ExitState> {
     use devices::IrqChip;
+    let irq_chip = irq_chip.as_irq_chip();
 
     loop {
         // Inject pending interrupts before running.
