@@ -35,8 +35,14 @@ fn main() {
 
     // For unix, libslirp-sys's build script will make the appropriate linking calls to pkg_config.
 
-    // Link vmnet.framework on macOS for VmnetTap.
+    // macOS: compile vmnet_helper.c and link vmnet.framework.
     if std::env::var("CARGO_CFG_TARGET_OS") == Ok("macos".to_string()) {
         println!("cargo:rustc-link-lib=framework=vmnet");
+
+        // Compile the C helper for vmnet Objective-C block callbacks.
+        cc::Build::new()
+            .file("src/sys/macos/vmnet_helper.c")
+            .flag("-fobjc-arc")
+            .compile("vmnet_helper");
     }
 }
