@@ -569,7 +569,7 @@ pub enum CrossPlatformDevicesCommands {
     Block(vhost_user_backend::BlockOptions),
     #[cfg(feature = "gpu")]
     Gpu(vhost_user_backend::GpuOptions),
-    #[cfg(feature = "net")]
+    #[cfg(all(feature = "net", not(target_os = "macos")))]
     Net(vhost_user_backend::NetOptions),
     #[cfg(feature = "audio")]
     Snd(vhost_user_backend::SndOptions),
@@ -2873,7 +2873,7 @@ impl TryFrom<RunCommand> for super::config::Config {
             }
         }
 
-        #[cfg(all(unix, feature = "net"))]
+        #[cfg(all(any(target_os = "android", target_os = "linux"), feature = "net"))]
         {
             use devices::virtio::VhostNetParameters;
             use devices::virtio::VHOST_NET_DEFAULT_PATH;
@@ -2986,6 +2986,12 @@ impl TryFrom<RunCommand> for super::config::Config {
                     return Err("mrg_rxbuf and packed_queue together is unsupported".to_string());
                 }
             }
+        }
+
+        // macOS: net devices are created automatically via vmnet in run_config.
+        #[cfg(all(target_os = "macos", feature = "net"))]
+        {
+            cfg.net = cmd.net;
         }
 
         #[cfg(any(target_os = "android", target_os = "linux"))]

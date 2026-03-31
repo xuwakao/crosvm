@@ -551,7 +551,7 @@ fn start_device(opts: cmdline::DeviceCommand) -> std::result::Result<(), ()> {
             CrossPlatformDevicesCommands::Block(cfg) => run_block_device(cfg),
             #[cfg(feature = "gpu")]
             CrossPlatformDevicesCommands::Gpu(cfg) => run_gpu_device(cfg),
-            #[cfg(feature = "net")]
+            #[cfg(all(feature = "net", not(target_os = "macos")))]
             CrossPlatformDevicesCommands::Net(cfg) => run_net_device(cfg),
             #[cfg(feature = "audio")]
             CrossPlatformDevicesCommands::Snd(cfg) => run_snd_device(cfg),

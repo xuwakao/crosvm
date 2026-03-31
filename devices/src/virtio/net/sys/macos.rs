@@ -13,6 +13,12 @@ use net_util::TapT;
 use super::super::NetError;
 use crate::virtio::Queue;
 
+use base::EventType;
+use base::ReadNotifier;
+use base::WaitContext;
+
+use super::super::Token;
+use super::super::Worker;
 use super::PendingBuffer;
 
 /// Validates and configures a tap device for use with virtio-net.
@@ -110,4 +116,51 @@ pub fn process_tx<T: TapT + FileReadWriteVolatile>(tx_queue: &mut Queue, mut tap
     }
 
     tx_queue.trigger_interrupt();
+}
+
+// Worker methods for macOS — equivalent to Linux's handle_rx_token/handle_rx_queue.
+impl<T> Worker<T>
+where
+    T: TapT + ReadNotifier + FileReadWriteVolatile,
+{
+    pub(in crate::virtio) fn handle_rx_token(
+        &mut self,
+        wait_ctx: &WaitContext<Token>,
+        pending_buffer: &mut PendingBuffer,
+    ) -> result::Result<(), NetError> {
+        match self.process_rx(pending_buffer) {
+            Ok(()) => Ok(()),
+            Err(NetError::RxDescriptorsExhausted) => {
+                wait_ctx
+                    .modify(&self.tap, EventType::None, Token::RxTap)
+                    .map_err(NetError::WaitContextDisableTap)?;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub(in crate::virtio) fn handle_rx_queue(
+        &mut self,
+        wait_ctx: &WaitContext<Token>,
+        tap_polling_enabled: bool,
+    ) -> result::Result<(), NetError> {
+        if !tap_polling_enabled {
+            wait_ctx
+                .modify(&self.tap, EventType::Read, Token::RxTap)
+                .map_err(NetError::WaitContextEnableTap)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn process_rx(
+        &mut self,
+        pending_buffer: &mut PendingBuffer,
+    ) -> result::Result<(), NetError> {
+        if self.acked_features & 1 << virtio_sys::virtio_net::VIRTIO_NET_F_MRG_RXBUF == 0 {
+            process_rx(&mut self.rx_queue, &mut self.tap)
+        } else {
+            process_mrg_rx(&mut self.rx_queue, &mut self.tap, pending_buffer)
+        }
+    }
 }
