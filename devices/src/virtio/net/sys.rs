@@ -29,9 +29,6 @@ impl PendingBuffer {
             buffer: Box::new([0u8; 65562]),
             length: 0,
         }
-    } else if #[cfg(target_os = "macos")] {
-        pub mod macos;
-        use macos as platform;
     }
 }
 

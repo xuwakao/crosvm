@@ -288,6 +288,20 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             info!("virtio-blk device created for {}", disk.path.display());
         }
 
+        // Network device: create VmnetTap-backed virtio-net if not disabled.
+        // Requires root privileges for vmnet shared mode.
+        if std::env::var("AETHERIA_NO_NET").is_err() {
+            match create_net_device(guest_mem_for_pci.clone()) {
+                Ok(pci_dev) => {
+                    devices.push((Box::new(pci_dev) as Box<dyn BusDeviceObj>, None));
+                    info!("virtio-net device created (vmnet shared mode)");
+                }
+                Err(e) => {
+                    info!("virtio-net not available: {:#} (set AETHERIA_NO_NET=1 to suppress)", e);
+                }
+            }
+        }
+
         let mut vcpu_ids: Vec<usize> = (0..vcpu_count).collect();
 
         info!("Building VM with Arch::build_vm...");
@@ -674,6 +688,54 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
 /// requests through the MSI tube. This handler allocates IRQ numbers from the
 /// system allocator and registers the irqfd with the IRQ chip, enabling the
 /// device to deliver completion interrupts to the GIC.
+/// Create a virtio-net device backed by vmnet.framework.
+#[cfg(target_arch = "aarch64")]
+fn create_net_device(
+    guest_mem: GuestMemory,
+) -> Result<VirtioPciDevice> {
+    use devices::virtio;
+    use net_util::sys::macos::VmnetTap;
+    use vm_control::api::VmMemoryClient;
+
+    let tap = VmnetTap::new_shared()
+        .context("failed to create vmnet interface (requires root)")?;
+
+    let base_features = virtio::base_features(ProtectionType::Unprotected);
+    let net_dev = Box::new(
+        virtio::Net::new(
+            base_features,
+            tap,
+            1,    // vq_pairs
+            None, // mac_addr (vmnet assigns)
+            false, // packed_queue
+            None, // pci_address
+            false, // mrg_rxbuf
+        )
+        .context("failed to create virtio-net device")?,
+    );
+
+    let (_msi_host_tube, msi_device_tube) =
+        Tube::pair().context("failed to create MSI tube for net")?;
+    let (ioevent_host_tube, ioevent_device_tube) =
+        Tube::pair().context("failed to create ioevent tube for net")?;
+    let (_vm_host_tube, vm_device_tube) =
+        Tube::pair().context("failed to create vm control tube for net")?;
+
+    // Keep ioevent host tube alive (leaked intentionally — same as blk device).
+    std::mem::forget(ioevent_host_tube);
+
+    VirtioPciDevice::new(
+        guest_mem,
+        net_dev,
+        msi_device_tube,
+        false,
+        None,
+        VmMemoryClient::new_noop_ioevent(ioevent_device_tube),
+        vm_device_tube,
+    )
+    .context("failed to create virtio-pci net device")
+}
+
 #[cfg(target_arch = "aarch64")]
 fn msi_handler_thread(
     mut irq_chip: Box<dyn devices::IrqChipAArch64>,

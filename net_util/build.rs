@@ -34,4 +34,9 @@ fn main() {
     }
 
     // For unix, libslirp-sys's build script will make the appropriate linking calls to pkg_config.
+
+    // Link vmnet.framework on macOS for VmnetTap.
+    if std::env::var("CARGO_CFG_TARGET_OS") == Ok("macos".to_string()) {
+        println!("cargo:rustc-link-lib=framework=vmnet");
+    }
 }
