@@ -77,9 +77,20 @@ struct Worker {
 impl Worker {
     fn process_queue(&mut self) -> P9Result<()> {
         while let Some(mut avail_desc) = self.queue.pop() {
-            self.server
+            let read_bytes = avail_desc.reader.available_bytes();
+            let write_bytes = avail_desc.writer.available_bytes();
+            match self.server
                 .handle_message(&mut avail_desc.reader, &mut avail_desc.writer)
-                .map_err(P9Error::Internal)?;
+            {
+                Ok(()) => {
+                    base::info!("p9: handled message, read={} write_avail={} written={}",
+                        read_bytes, write_bytes, avail_desc.writer.bytes_written());
+                }
+                Err(e) => {
+                    base::error!("p9: handle_message error: {}", e);
+                    return Err(P9Error::Internal(e));
+                }
+            }
 
             self.queue.add_used(avail_desc);
         }
@@ -172,20 +183,16 @@ impl VirtioDevice for P9 {
     }
 
     fn ack_features(&mut self, value: u64) {
-        let mut v = value;
-
-        // Check if the guest is ACK'ing a feature that we didn't claim to have.
-        let unrequested_features = v & !self.avail_features;
-        if unrequested_features != 0 {
-            warn!("virtio_9p got unknown feature ack: {:x}", v);
-
-            // Don't count these features as acked.
-            v &= !unrequested_features;
+        let unrequested = value & !self.avail_features;
+        if unrequested != 0 {
+            warn!("p9: guest acked unknown features: {:#x}", unrequested);
         }
-        self.acked_features |= v;
+        self.acked_features |= value & self.avail_features;
+        base::info!("p9: features negotiated: avail={:#x} acked={:#x}", self.avail_features, self.acked_features);
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
+        base::info!("p9: read_config offset={} len={} config_len={}", offset, data.len(), self.config.len());
         copy_config(data, 0, self.config.as_slice(), offset);
     }
 

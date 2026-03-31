@@ -269,10 +269,23 @@ fn statat(d: &File, name: &CStr, flags: libc::c_int) -> io::Result<stat64> {
 }
 
 fn stat(f: &File) -> io::Result<stat64> {
-    // Safe because this is a constant value and a valid C string.
-    let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") };
-
-    statat(f, pathname, AT_EMPTY_PATH)
+    // Linux: use fstatat with AT_EMPTY_PATH to stat the fd itself.
+    // macOS: AT_EMPTY_PATH doesn't exist, use fstat directly.
+    #[cfg(not(target_os = "macos"))]
+    {
+        let pathname = unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") };
+        statat(f, pathname, AT_EMPTY_PATH)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut st = MaybeUninit::<stat64>::zeroed();
+        let res = unsafe { fstat64(f.as_raw_fd(), st.as_mut_ptr()) };
+        if res >= 0 {
+            Ok(unsafe { st.assume_init() })
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
 }
 
 fn string_to_cstring(s: String) -> io::Result<CString> {
