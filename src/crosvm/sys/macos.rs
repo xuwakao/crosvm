@@ -345,6 +345,60 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             }
         }
 
+        // 9P filesystem sharing: share host directory with guest VM.
+        // Guest mounts via: mount -t 9p -o trans=virtio,version=9p2000.L host_share /mnt
+        let share_path = std::env::var("AETHERIA_SHARE")
+            .unwrap_or_else(|_| "/private/tmp/aetheria-share".to_string());
+        // Resolve symlinks (macOS /tmp → /private/tmp) so p9 server can open the dir.
+        let share_path = std::fs::canonicalize(&share_path)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or(share_path);
+        if std::path::Path::new(&share_path).is_dir() {
+            use devices::virtio;
+            use devices::virtio::P9;
+            use vm_control::api::VmMemoryClient;
+
+            let tag = "host_share";
+            let p9_cfg = ::p9::Config {
+                root: std::path::PathBuf::from(&share_path).into_boxed_path(),
+                ..Default::default()
+            };
+            match P9::new(virtio::base_features(ProtectionType::Unprotected), tag, p9_cfg) {
+                Ok(p9_dev) => {
+                    let (msi_tube, msi_device_tube) =
+                        Tube::pair().context("9p MSI tube")?;
+                    let (ioevent_tube, ioevent_device_tube) =
+                        Tube::pair().context("9p ioevent tube")?;
+                    let (vm_tube, vm_device_tube) =
+                        Tube::pair().context("9p vm tube")?;
+                    std::mem::forget(msi_tube);
+                    std::mem::forget(ioevent_tube);
+                    std::mem::forget(vm_tube);
+
+                    match VirtioPciDevice::new(
+                        guest_mem_for_pci.clone(),
+                        Box::new(p9_dev),
+                        msi_device_tube,
+                        false,
+                        None,
+                        VmMemoryClient::new_noop_ioevent(ioevent_device_tube),
+                        vm_device_tube,
+                    ) {
+                        Ok(pci_dev) => {
+                            devices.push((Box::new(pci_dev) as Box<dyn BusDeviceObj>, None));
+                            info!("virtio-9p device created, sharing '{}' as '{}'", share_path, tag);
+                        }
+                        Err(e) => {
+                            info!("virtio-9p PCI wrap failed: {:#}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    info!("virtio-9p creation failed: {}", e);
+                }
+            }
+        }
+
         let mut vcpu_ids: Vec<usize> = (0..vcpu_count).collect();
 
         info!("Building VM with Arch::build_vm...");

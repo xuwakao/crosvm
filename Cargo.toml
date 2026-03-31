@@ -586,6 +586,7 @@ kernel_loader = { workspace = true }
 kvm_sys = { workspace = true, optional = true }
 libc = { workspace = true }
 libcras = "*"
+p9 = "0.3.1"
 # Compile out trace statements in release builds
 log = { version = "0", features = ["release_max_level_debug"]}
 metrics = { workspace = true }
@@ -648,3 +649,4 @@ tempfile = "3"
 audio_streams = { path = "common/audio_streams" }
 libcras = { path = "libcras_stub" } # ignored by ebuild
 minijail = { path = "third_party/minijail/rust/minijail" } # ignored by ebuild
+p9 = { path = "p9" } # patched for macOS compatibility (stat64→stat, readdir64→readdir)

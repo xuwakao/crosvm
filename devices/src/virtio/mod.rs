@@ -136,7 +136,8 @@ cfg_if::cfg_if! {
     } else if #[cfg(windows)] {
         pub use self::vsock::Vsock;
     } else if #[cfg(target_os = "macos")] {
-        // macOS: minimal virtio exports
+        mod p9;
+        pub use self::p9::P9;
     } else {
         compile_error!("Unsupported platform");
     }
