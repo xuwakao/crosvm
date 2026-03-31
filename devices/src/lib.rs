@@ -139,7 +139,9 @@ pub use self::serial_device::SerialType;
 pub use self::smccc_trng::SmcccTrng;
 #[cfg(target_os = "macos")]
 pub use self::psci::CpuOnCallback;
+pub use self::psci::CpuOnResult;
 pub use self::psci::PsciDevice;
+pub use self::psci::SystemOffCallback;
 #[cfg(target_os = "macos")]
 pub use self::psci::PSCI_EXIT_NONE;
 #[cfg(target_os = "macos")]

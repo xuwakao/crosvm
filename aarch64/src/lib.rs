@@ -701,15 +701,6 @@ impl arch::LinuxArch for AArch64 {
                     .map_err(Error::CreateVcpu)?
                     .downcast::<Vcpu>()
                     .map_err(|_| Error::DowncastVcpu)?;
-                #[cfg(target_os = "macos")]
-                {
-                    let mpidr_val = hypervisor::hvf::ffi::MPIDR_RES1 | (vcpu_id as u64);
-                    if let Err(e) = vcpu.set_one_reg(VcpuRegAArch64::System(
-                        aarch64_sys_reg::MPIDR_EL1,
-                    ), mpidr_val) {
-                        base::warn!("Failed to set MPIDR_EL1 for vCPU {}: {}", vcpu_id, e);
-                    }
-                }
                 let per_vcpu_init = if vm
                     .get_hypervisor()
                     .check_capability(HypervisorCap::HypervisorInitializedBootContext)

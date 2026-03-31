@@ -5,6 +5,7 @@
 // registers on the hypercall bus and handles all standard PSCI 1.0 calls.
 //
 // SYSTEM_OFF and SYSTEM_RESET signal the vCPU loop via a shared atomic flag.
+// CPU_ON signals secondary vCPU threads via a callback.
 
 use std::ops::Range;
 use std::sync::atomic::AtomicU8;
@@ -41,6 +42,8 @@ const PSCI_AFFINITY_INFO_64: u32 = 0xc4000004;
 // PSCI return values (signed, per spec).
 const PSCI_SUCCESS: i32 = 0;
 const PSCI_NOT_SUPPORTED: i32 = -1;
+const PSCI_INVALID_PARAMETERS: i32 = -2;
+const PSCI_ALREADY_ON: i32 = -4;
 
 // PSCI_VERSION returns major.minor packed as (major << 16) | minor.
 const PSCI_VERSION_1_0: usize = 0x00010000;
@@ -53,17 +56,24 @@ pub const PSCI_EXIT_NONE: u8 = 0;
 pub const PSCI_EXIT_SHUTDOWN: u8 = 1;
 pub const PSCI_EXIT_RESET: u8 = 2;
 
-/// PSCI device that handles ARM Power State Coordination Interface calls.
-///
-/// Registers on the hypercall bus for PSCI function ID ranges. When the guest
-/// calls PSCI_SYSTEM_OFF or PSCI_SYSTEM_RESET, the device sets `exit_request`
-/// which the vCPU loop checks to terminate.
-/// Callback for PSCI CPU_ON: (target_cpu_mpidr, entry_point, context_id) -> success.
-pub type CpuOnCallback = Arc<dyn Fn(u64, u64, u64) -> bool + Send + Sync>;
+/// Result of a CPU_ON attempt.
+pub enum CpuOnResult {
+    Success,
+    AlreadyOn,
+    InvalidParameters,
+}
 
+/// Callback for PSCI CPU_ON: (target_cpu_mpidr, entry_point, context_id) -> result.
+pub type CpuOnCallback = Arc<dyn Fn(u64, u64, u64) -> CpuOnResult + Send + Sync>;
+
+/// Callback for PSCI SYSTEM_OFF/RESET: cancel all vCPUs.
+pub type SystemOffCallback = Arc<dyn Fn() + Send + Sync>;
+
+/// PSCI device that handles ARM Power State Coordination Interface calls.
 pub struct PsciDevice {
     exit_request: Arc<AtomicU8>,
     cpu_on_callback: Option<CpuOnCallback>,
+    system_off_callback: Option<SystemOffCallback>,
 }
 
 impl PsciDevice {
@@ -73,7 +83,11 @@ impl PsciDevice {
     pub const HVC64_FID_RANGE: Range<u32> = 0xC400_0000..0xC400_0010;
 
     pub fn new(exit_request: Arc<AtomicU8>) -> Self {
-        Self { exit_request, cpu_on_callback: None }
+        Self {
+            exit_request,
+            cpu_on_callback: None,
+            system_off_callback: None,
+        }
     }
 
     pub fn with_cpu_on_callback(mut self, cb: CpuOnCallback) -> Self {
@@ -81,9 +95,13 @@ impl PsciDevice {
         self
     }
 
-    /// Returns the PSCI_NOT_SUPPORTED value sign-extended to usize.
-    fn not_supported() -> usize {
-        PSCI_NOT_SUPPORTED as u32 as usize
+    pub fn with_system_off_callback(mut self, cb: SystemOffCallback) -> Self {
+        self.system_off_callback = Some(cb);
+        self
+    }
+
+    fn psci_return(val: i32) -> usize {
+        val as u32 as usize
     }
 }
 
@@ -103,7 +121,6 @@ impl BusDevice for PsciDevice {
                 [PSCI_VERSION_1_0, 0, 0, 0]
             }
             PSCI_MIGRATE_INFO_TYPE => {
-                // Trusted OS not present — no migration needed.
                 [TOS_NOT_PRESENT_MP, 0, 0, 0]
             }
             PSCI_FEATURES => {
@@ -122,11 +139,10 @@ impl BusDevice for PsciDevice {
                 if supported {
                     [PSCI_SUCCESS as usize, 0, 0, 0]
                 } else {
-                    [Self::not_supported(), 0, 0, 0]
+                    [Self::psci_return(PSCI_NOT_SUPPORTED), 0, 0, 0]
                 }
             }
             PSCI_CPU_OFF => {
-                // CPU_OFF on the only vCPU — halt.
                 [PSCI_SUCCESS as usize, 0, 0, 0]
             }
             PSCI_CPU_ON_32 | PSCI_CPU_ON_64 => {
@@ -134,30 +150,38 @@ impl BusDevice for PsciDevice {
                 let entry_point = *abi.get_argument(1).unwrap_or(&0) as u64;
                 let context_id = *abi.get_argument(2).unwrap_or(&0) as u64;
                 if let Some(ref cb) = self.cpu_on_callback {
-                    if cb(target_cpu, entry_point, context_id) {
-                        [PSCI_SUCCESS as usize, 0, 0, 0]
-                    } else {
-                        [Self::not_supported(), 0, 0, 0]
+                    match cb(target_cpu, entry_point, context_id) {
+                        CpuOnResult::Success => [PSCI_SUCCESS as usize, 0, 0, 0],
+                        CpuOnResult::AlreadyOn => [Self::psci_return(PSCI_ALREADY_ON), 0, 0, 0],
+                        CpuOnResult::InvalidParameters => {
+                            [Self::psci_return(PSCI_INVALID_PARAMETERS), 0, 0, 0]
+                        }
                     }
                 } else {
-                    [Self::not_supported(), 0, 0, 0]
+                    [Self::psci_return(PSCI_NOT_SUPPORTED), 0, 0, 0]
                 }
             }
             PSCI_CPU_SUSPEND_32 | PSCI_CPU_SUSPEND_64 => {
-                [Self::not_supported(), 0, 0, 0]
+                [Self::psci_return(PSCI_NOT_SUPPORTED), 0, 0, 0]
             }
             PSCI_AFFINITY_INFO_32 | PSCI_AFFINITY_INFO_64 => {
-                [Self::not_supported(), 0, 0, 0]
+                [Self::psci_return(PSCI_NOT_SUPPORTED), 0, 0, 0]
             }
             PSCI_SYSTEM_OFF => {
                 info!("PSCI: SYSTEM_OFF requested");
                 self.exit_request
                     .store(PSCI_EXIT_SHUTDOWN, Ordering::Release);
+                if let Some(ref cb) = self.system_off_callback {
+                    cb();
+                }
                 [PSCI_SUCCESS as usize, 0, 0, 0]
             }
             PSCI_SYSTEM_RESET => {
                 info!("PSCI: SYSTEM_RESET requested");
                 self.exit_request.store(PSCI_EXIT_RESET, Ordering::Release);
+                if let Some(ref cb) = self.system_off_callback {
+                    cb();
+                }
                 [PSCI_SUCCESS as usize, 0, 0, 0]
             }
             _ => {

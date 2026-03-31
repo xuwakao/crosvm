@@ -47,9 +47,6 @@ pub struct HvfGicChip {
     irq_events: Arc<Mutex<Vec<IrqEvent>>>,
     // Track which IRQs are pending (one bool per GSI).
     pending_irqs: Arc<Mutex<Vec<bool>>>,
-    // Track which SPIs are currently asserted via hv_gic_set_spi.
-    // inject_interrupts deasserts these after the vCPU has had a chance to process.
-    asserted_spis: Arc<Mutex<Vec<bool>>>,
     // HVF vCPU handles for cross-thread interrupt injection.
     vcpu_handles: Arc<Mutex<Vec<u64>>>,
 }
@@ -63,7 +60,6 @@ impl HvfGicChip {
             num_vcpus,
             irq_events: Arc::new(Mutex::new(Vec::new())),
             pending_irqs: Arc::new(Mutex::new(vec![false; MAX_IRQS])),
-            asserted_spis: Arc::new(Mutex::new(vec![false; MAX_IRQS])),
             vcpu_handles: Arc::new(Mutex::new(Vec::new())),
         })
     }
@@ -167,7 +163,6 @@ impl IrqChip for HvfGicChip {
         let events = self.irq_events.lock();
         if let Some(irq_event) = events.get(event_index) {
             let gsi = irq_event.gsi;
-            let is_level = irq_event.level_triggered;
             // Clear the event so the IRQ handler doesn't re-enter immediately.
             let _ = irq_event.trigger_event.wait();
 
@@ -227,6 +222,21 @@ impl IrqChip for HvfGicChip {
         use hypervisor::hvf::ffi;
         use hypervisor::hvf::vcpu::HvfVcpu;
 
+        // With native HVF GIC (macOS 15+), hv_gic_set_spi handles interrupt
+        // routing through the virtual GIC hardware. hv_vcpu_set_pending_interrupt
+        // is only needed for the non-GIC fallback (macOS <15).
+        //
+        // On native GIC, pending_irqs is set by service_irq_event but the actual
+        // delivery happens via hv_gic_set_spi. We just clear pending here.
+        if ffi::hvf_gic_is_available() {
+            let mut pending = self.pending_irqs.lock();
+            for p in pending.iter_mut() {
+                *p = false;
+            }
+            return Ok(());
+        }
+
+        // macOS <15 fallback: use hv_vcpu_set_pending_interrupt.
         let hvf_vcpu: &HvfVcpu = vcpu
             .downcast_ref()
             .expect("HvfGicChip::inject_interrupts called with non-HvfVcpu");
@@ -234,8 +244,6 @@ impl IrqChip for HvfGicChip {
         let mut pending = self.pending_irqs.lock();
         let has_pending = pending.iter().any(|&p| p);
         if has_pending {
-            // Inject IRQ signal. The guest GIC will determine which specific interrupt
-            // to service based on its own priority/enable state.
             let ret = unsafe {
                 ffi::hv_vcpu_set_pending_interrupt(
                     hvf_vcpu.hvf_handle(),
@@ -246,12 +254,10 @@ impl IrqChip for HvfGicChip {
             if ret != ffi::HV_SUCCESS {
                 return Err(Error::new(libc::EIO));
             }
-            // Clear all pending after injection.
             for p in pending.iter_mut() {
                 *p = false;
             }
         } else {
-            // Deassert IRQ line if nothing pending.
             let ret = unsafe {
                 ffi::hv_vcpu_set_pending_interrupt(
                     hvf_vcpu.hvf_handle(),
@@ -294,7 +300,6 @@ impl IrqChip for HvfGicChip {
             num_vcpus: self.num_vcpus,
             irq_events: Arc::clone(&self.irq_events),
             pending_irqs: Arc::clone(&self.pending_irqs),
-            asserted_spis: Arc::clone(&self.asserted_spis),
             vcpu_handles: Arc::clone(&self.vcpu_handles),
         })
     }
