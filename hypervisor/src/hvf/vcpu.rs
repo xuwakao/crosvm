@@ -383,15 +383,6 @@ impl Vcpu for HvfVcpu {
             // which is NOT zero. We must handle XZR explicitly.
             let val = if srt == 31 { 0 } else { self.get_reg(ffi::HV_REG_X0 + srt)? };
             let data = val.to_le_bytes();
-            // Debug: log first few MMIO writes to PCI BAR region
-            if ipa >= 0x2000000 && ipa < 0x2008000 {
-                use std::sync::atomic::{AtomicU32, Ordering};
-                static MMIO_COUNT: AtomicU32 = AtomicU32::new(0);
-                let c = MMIO_COUNT.fetch_add(1, Ordering::Relaxed);
-                if c < 20 {
-                    base::info!("MMIO write: ipa={:#x} srt={} len={} val={:#x} syndrome={:#x}", ipa, srt, len, val, syndrome);
-                }
-            }
             handle_fn(IoParams {
                 address: ipa,
                 operation: IoOperation::Write(&data[..len]),
