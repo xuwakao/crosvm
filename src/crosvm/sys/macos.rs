@@ -706,16 +706,34 @@ fn create_net_device(
     // gateway won't route packets correctly.
     let vmnet_mac = tap.mac_address().ok();
 
-    let base_features = virtio::base_features(ProtectionType::Unprotected);
+    // Build features manually: vmnet does NOT support checksum/TSO/UFO offload.
+    // If we offer VIRTIO_NET_F_CSUM, the guest sends UDP packets with partial
+    // checksums that vmnet's NAT gateway silently drops (DNS fails).
+    // Only offer MAC + MTU + CTRL_VQ on macOS.
+    //
+    // Feature bit values from virtio_net.h (stable since virtio 1.0):
+    const VIRTIO_NET_F_MAC: u64 = 5;
+    const VIRTIO_NET_F_MTU: u64 = 3;
+    const VIRTIO_NET_F_CTRL_VQ: u64 = 17;
+
+    let mut avail_features = virtio::base_features(ProtectionType::Unprotected)
+        | 1 << VIRTIO_NET_F_MTU
+        | 1 << VIRTIO_NET_F_CTRL_VQ;
+    if vmnet_mac.is_some() {
+        avail_features |= 1 << VIRTIO_NET_F_MAC;
+    }
+
+    let taps = tap.into_mq_taps(1)
+        .map_err(|e| anyhow::anyhow!("into_mq_taps: {:?}", e))?;
+    let mtu = taps[0].mtu().unwrap_or(1500);
+
     let net_dev = Box::new(
-        virtio::Net::new(
-            base_features,
-            tap,
-            1,    // vq_pairs
+        virtio::Net::new_internal(
+            taps,
+            avail_features,
+            mtu,
             vmnet_mac,
-            false, // packed_queue
             None, // pci_address
-            false, // mrg_rxbuf
         )
         .context("failed to create virtio-net device")?,
     );

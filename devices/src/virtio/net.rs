@@ -555,7 +555,7 @@ where
         )
     }
 
-    pub(crate) fn new_internal(
+    pub fn new_internal(
         taps: Vec<T>,
         avail_features: u64,
         mtu: u16,
