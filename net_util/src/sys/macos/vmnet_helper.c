@@ -1,28 +1,34 @@
-// vmnet_helper.c — C helper for vmnet.framework Objective-C block callbacks.
+// vmnet_helper.c — C helper for vmnet.framework on macOS.
+// Provides synchronous wrappers around vmnet's block-based API.
 //
-// Rust can't reliably create Objective-C blocks. This C file provides
-// thin wrappers around vmnet functions that use blocks, converting them
-// to standard C callbacks that Rust can call via FFI.
+// Do NOT compile with -fobjc-arc: ARC changes block lifetime semantics and
+// causes dispatch_semaphore + vmnet_start_interface to deadlock.
+// Manual memory management (MRC) is required.
 
 #include <vmnet/vmnet.h>
 #include <dispatch/dispatch.h>
 #include <string.h>
 #include <stdio.h>
+#include <unistd.h>
+#include <errno.h>
 
-// Global state for synchronous vmnet_start_interface.
-static vmnet_return_t g_start_status = 0;
-static xpc_object_t g_start_params = NULL;
-static dispatch_semaphore_t g_start_sem = NULL;
+// Timeout for vmnet_start_interface completion callback (seconds).
+// vmnet typically responds within ~200ms on a healthy system.
+// 10 seconds accommodates heavily loaded hosts or slow I/O.
+#define VMNET_START_TIMEOUT_SEC 10LL
 
-// Start a vmnet interface synchronously.
-// Returns the interface ref, or NULL on failure.
-// On success, *out_status is set to the vmnet status,
-// *out_mac is set to the MAC address string (e.g. "aa:bb:cc:dd:ee:ff"),
-// *out_mtu is set to the interface MTU.
+// Timeout for vmnet_stop_interface completion callback (seconds).
+// Stop is faster than start; 5 seconds is generous.
+#define VMNET_STOP_TIMEOUT_SEC 5LL
+
+// Sentinel value indicating a timeout in vmnet_helper_stop_interface.
+// Must be distinct from VMNET_SUCCESS (1000) and valid vmnet error codes.
+#define VMNET_HELPER_TIMEOUT 0xFFFFFFFFU
+
 interface_ref vmnet_helper_start_interface(
     uint64_t mode,
-    vmnet_return_t *out_status,
-    char *out_mac,      // must be >= 18 bytes
+    uint32_t *out_status,
+    char *out_mac,
     size_t mac_buf_len,
     uint64_t *out_mtu,
     uint64_t *out_max_packet_size
@@ -32,70 +38,88 @@ interface_ref vmnet_helper_start_interface(
 
     dispatch_queue_t queue = dispatch_queue_create(
         "com.aetheria.vmnet", DISPATCH_QUEUE_SERIAL);
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
 
-    g_start_sem = dispatch_semaphore_create(0);
-    g_start_status = 0;
-    g_start_params = NULL;
+    __block vmnet_return_t cb_status = 0;
+    __block xpc_object_t cb_params = NULL;
 
     interface_ref iface = vmnet_start_interface(desc, queue,
         ^(vmnet_return_t status, xpc_object_t interface_param) {
-            g_start_status = status;
+            cb_status = status;
             if (interface_param) {
-                g_start_params = interface_param;
-                // Retain so it survives after the block returns
+                cb_params = interface_param;
                 xpc_retain(interface_param);
             }
-            dispatch_semaphore_signal(g_start_sem);
+            dispatch_semaphore_signal(sem);
         });
 
-    // Wait for the completion handler (timeout 5 seconds)
-    dispatch_time_t timeout = dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC);
-    long result = dispatch_semaphore_wait(g_start_sem, timeout);
+    xpc_release(desc);
 
-    if (result != 0) {
-        // Timeout
-        if (out_status) *out_status = 0; // failure
-        if (iface) {
-            vmnet_stop_interface(iface, queue, ^(vmnet_return_t s) {});
-        }
+    // If vmnet_start_interface returns NULL, the callback will never fire.
+    if (!iface) {
+        if (out_status) *out_status = 0;
+        dispatch_release(sem);
+        dispatch_release(queue);
         return NULL;
     }
 
-    if (out_status) *out_status = g_start_status;
-
-    if (g_start_status != VMNET_SUCCESS) {
-        if (iface) {
-            vmnet_stop_interface(iface, queue, ^(vmnet_return_t s) {});
-        }
+    long r = dispatch_semaphore_wait(sem,
+        dispatch_time(DISPATCH_TIME_NOW, VMNET_START_TIMEOUT_SEC * NSEC_PER_SEC));
+    if (r != 0) {
+        if (out_status) *out_status = 0;
+        vmnet_stop_interface(iface, queue, ^(vmnet_return_t s) {
+            (void)s;
+        });
+        dispatch_release(sem);
+        dispatch_release(queue);
         return NULL;
     }
 
-    // Extract interface parameters
-    if (g_start_params) {
-        if (out_mac) {
+    if (out_status) *out_status = cb_status;
+
+    if (cb_status != VMNET_SUCCESS) {
+        vmnet_stop_interface(iface, queue, ^(vmnet_return_t s) {
+            (void)s;
+        });
+        if (cb_params) xpc_release(cb_params);
+        dispatch_release(sem);
+        dispatch_release(queue);
+        return NULL;
+    }
+
+    if (cb_params) {
+        if (out_mac && mac_buf_len > 0) {
             const char *mac = xpc_dictionary_get_string(
-                g_start_params, vmnet_mac_address_key);
+                cb_params, vmnet_mac_address_key);
             if (mac) {
-                strncpy(out_mac, mac, mac_buf_len - 1);
-                out_mac[mac_buf_len - 1] = '\0';
+                size_t mac_len = strlen(mac);
+                if (mac_len >= mac_buf_len) {
+                    // MAC string too long — signal error via empty string.
+                    out_mac[0] = '\0';
+                } else {
+                    memcpy(out_mac, mac, mac_len + 1);
+                }
+            } else {
+                out_mac[0] = '\0';
             }
         }
         if (out_mtu) {
-            *out_mtu = xpc_dictionary_get_uint64(
-                g_start_params, vmnet_mtu_key);
+            *out_mtu = xpc_dictionary_get_uint64(cb_params, vmnet_mtu_key);
         }
         if (out_max_packet_size) {
             *out_max_packet_size = xpc_dictionary_get_uint64(
-                g_start_params, vmnet_max_packet_size_key);
+                cb_params, vmnet_max_packet_size_key);
         }
-        xpc_release(g_start_params);
-        g_start_params = NULL;
+        xpc_release(cb_params);
     }
+
+    dispatch_release(sem);
+    // Note: do NOT release queue here — vmnet retains it for the interface lifetime.
+    // It will be released in vmnet_helper_stop_interface or by vmnet on teardown.
 
     return iface;
 }
 
-// Stop a vmnet interface synchronously.
 vmnet_return_t vmnet_helper_stop_interface(interface_ref iface) {
     if (!iface) return VMNET_SUCCESS;
 
@@ -110,11 +134,20 @@ vmnet_return_t vmnet_helper_stop_interface(interface_ref iface) {
             dispatch_semaphore_signal(sem);
         });
 
-    dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5LL * NSEC_PER_SEC));
+    long r = dispatch_semaphore_wait(sem,
+        dispatch_time(DISPATCH_TIME_NOW, VMNET_STOP_TIMEOUT_SEC * NSEC_PER_SEC));
+
+    dispatch_release(sem);
+    dispatch_release(queue);
+
+    if (r != 0) {
+        fprintf(stderr, "[vmnet] stop_interface timed out after %llds\n",
+                VMNET_STOP_TIMEOUT_SEC);
+        return VMNET_HELPER_TIMEOUT;
+    }
     return stop_status;
 }
 
-// Set up event callback that writes to a pipe fd when packets are available.
 void vmnet_helper_set_event_callback(
     interface_ref iface,
     dispatch_queue_t queue,
@@ -123,14 +156,19 @@ void vmnet_helper_set_event_callback(
     vmnet_interface_set_event_callback(iface,
         VMNET_INTERFACE_PACKETS_AVAILABLE, queue,
         ^(interface_event_t event_mask, xpc_object_t event) {
-            // Write a byte to the pipe to signal packet availability.
+            (void)event_mask;
+            (void)event;
             char c = 1;
-            write(write_fd, &c, 1);
+            ssize_t ret;
+            do {
+                ret = write(write_fd, &c, 1);
+            } while (ret < 0 && errno == EINTR);
+            // EAGAIN/EPIPE: pipe full or closed — nothing we can do from
+            // callback context. The event loop will pick up packets on the
+            // next timer tick or queue notification regardless.
         });
 }
 
-// Read one packet from vmnet interface.
-// Returns the number of bytes read, or -1 on error, or 0 if no packets.
 ssize_t vmnet_helper_read(interface_ref iface, void *buf, size_t buf_len) {
     struct iovec iov;
     iov.iov_base = buf;
@@ -146,11 +184,11 @@ ssize_t vmnet_helper_read(interface_ref iface, void *buf, size_t buf_len) {
     vmnet_return_t ret = vmnet_read(iface, &pkt, &pktcnt);
     if (ret != VMNET_SUCCESS) return -1;
     if (pktcnt == 0 || pkt.vm_pkt_size == 0) return 0;
+    // Defensive: vmnet must not write beyond the iov buffer.
+    if (pkt.vm_pkt_size > buf_len) return -1;
     return (ssize_t)pkt.vm_pkt_size;
 }
 
-// Write one packet to vmnet interface.
-// Returns bytes written, or -1 on error.
 ssize_t vmnet_helper_write(interface_ref iface, const void *buf, size_t len) {
     struct iovec iov;
     iov.iov_base = (void *)buf;
@@ -165,5 +203,6 @@ ssize_t vmnet_helper_write(interface_ref iface, const void *buf, size_t len) {
     int pktcnt = 1;
     vmnet_return_t ret = vmnet_write(iface, &pkt, &pktcnt);
     if (ret != VMNET_SUCCESS) return -1;
+    if (pktcnt == 0) return -1; // vmnet accepted call but dropped the packet.
     return (ssize_t)len;
 }

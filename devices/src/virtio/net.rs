@@ -381,7 +381,7 @@ where
                 self.overlapped_wrapper.get_h_event_ref().unwrap(),
                 Token::RxTap,
             ),
-            #[cfg(any(target_os = "android", target_os = "linux"))]
+            #[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
             (self.tap.get_read_notifier(), Token::RxTap),
             (self.rx_queue.event(), Token::RxQueue),
             (self.tx_queue.event(), Token::TxQueue),
@@ -404,6 +404,10 @@ where
                     Token::RxTap => {
                         let _trace = cros_tracing::trace_event!(VirtioNet, "handle RxTap event");
                         self.handle_rx_token(&wait_ctx, &mut pending_buffer_for_mrg_rx)?;
+                        // Conservatively mark as disabled. If handle_rx_token exhausted
+                        // descriptors, it already disabled tap in wait_ctx. If not, the
+                        // flag is a harmless lie — RxQueue will re-enable it (no-op if
+                        // already enabled). This matches upstream crosvm design.
                         tap_polling_enabled = false;
                     }
                     Token::RxQueue => {

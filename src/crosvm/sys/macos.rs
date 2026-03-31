@@ -695,10 +695,16 @@ fn create_net_device(
 ) -> Result<VirtioPciDevice> {
     use devices::virtio;
     use net_util::sys::macos::VmnetTap;
+    use net_util::TapTCommon;
     use vm_control::api::VmMemoryClient;
 
     let tap = VmnetTap::new_shared()
         .context("failed to create vmnet interface (requires root)")?;
+
+    // Use the MAC address assigned by vmnet so the guest uses the correct L2 address
+    // for DHCP and ARP. Without this, the guest picks a random MAC and vmnet's NAT
+    // gateway won't route packets correctly.
+    let vmnet_mac = tap.mac_address().ok();
 
     let base_features = virtio::base_features(ProtectionType::Unprotected);
     let net_dev = Box::new(
@@ -706,7 +712,7 @@ fn create_net_device(
             base_features,
             tap,
             1,    // vq_pairs
-            None, // mac_addr (vmnet assigns)
+            vmnet_mac,
             false, // packed_queue
             None, // pci_address
             false, // mrg_rxbuf
@@ -714,15 +720,17 @@ fn create_net_device(
         .context("failed to create virtio-net device")?,
     );
 
-    let (_msi_host_tube, msi_device_tube) =
+    // Host-side tubes are leaked intentionally: they must outlive the device
+    // for the paired device-side tubes to remain connected. Same pattern as blk.
+    let (msi_host_tube, msi_device_tube) =
         Tube::pair().context("failed to create MSI tube for net")?;
     let (ioevent_host_tube, ioevent_device_tube) =
         Tube::pair().context("failed to create ioevent tube for net")?;
-    let (_vm_host_tube, vm_device_tube) =
+    let (vm_host_tube, vm_device_tube) =
         Tube::pair().context("failed to create vm control tube for net")?;
-
-    // Keep ioevent host tube alive (leaked intentionally — same as blk device).
+    std::mem::forget(msi_host_tube);
     std::mem::forget(ioevent_host_tube);
+    std::mem::forget(vm_host_tube);
 
     VirtioPciDevice::new(
         guest_mem,
