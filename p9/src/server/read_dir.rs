@@ -21,8 +21,6 @@ pub struct DirEntry {
 
 pub struct ReadDir {
     dir: *mut libc::DIR,
-    #[cfg(target_os = "macos")]
-    offset: u64,
 }
 
 impl Drop for ReadDir {
@@ -45,14 +43,11 @@ impl ReadDir {
 
         let (d_ino, d_type) = unsafe { ((*dirent).d_ino, (*dirent).d_type) };
 
-        // d_off: available on Linux, synthesized on macOS (telldir position).
+        // d_off: Linux has it in dirent; macOS uses telldir() for position.
         #[cfg(not(target_os = "macos"))]
         let d_off = unsafe { (*dirent).d_off } as u64;
         #[cfg(target_os = "macos")]
-        let d_off = {
-            self.offset += 1;
-            self.offset
-        };
+        let d_off = unsafe { libc::telldir(self.dir) } as u64;
 
         let d_name: &[u8] = unsafe { std::mem::transmute((*dirent).d_name.as_ref()) };
         let name = match P9String::new(strip_padding(d_name)) {
@@ -79,11 +74,7 @@ pub fn read_dir<D: AsRawFd>(dir: &mut D, offset: libc::c_long) -> Result<ReadDir
         return Err(std::io::Error::last_os_error());
     }
 
-    let read_dir = ReadDir {
-        dir,
-        #[cfg(target_os = "macos")]
-        offset: offset as u64,
-    };
+    let read_dir = ReadDir { dir };
 
     unsafe { libc::seekdir(read_dir.dir, offset) };
 

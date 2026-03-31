@@ -103,6 +103,16 @@ fn fd_path(fd: RawFd) -> String {
     { format!("fd/{}", fd) }
 }
 
+/// Flags for opening a path reference (fid) without read/write access.
+/// Linux: O_PATH gives a non-dereferenceable fd for path operations only.
+/// macOS: O_PATH doesn't exist; use O_RDONLY for equivalent stat/walk behavior.
+fn o_path_flags() -> libc::c_int {
+    #[cfg(not(target_os = "macos"))]
+    { O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC }
+    #[cfg(target_os = "macos")]
+    { libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC }
+}
+
 // Tlopen and Tlcreate flags.  Taken from "include/net/9p/9p.h" in the linux tree.
 const P9_RDONLY: u32 = 0o00000000;
 const P9_WRONLY: u32 = 0o00000001;
@@ -384,7 +394,7 @@ fn lookup(parent: &File, name: &CStr) -> io::Result<File> {
         openat64(
             parent.as_raw_fd(),
             name.as_ptr(),
-            O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            o_path_flags(),
         )
     })?;
 
@@ -421,8 +431,6 @@ fn do_walk(
 }
 
 fn open_fid(proc: &File, path: &File, p9_flags: u32) -> io::Result<File> {
-    let pathname = string_to_cstring(fd_path(path.as_raw_fd()))?;
-
     // We always open files with O_CLOEXEC.
     let mut flags: i32 = libc::O_CLOEXEC;
     for &(p9f, of) in &MAPPED_FLAGS {
@@ -435,17 +443,37 @@ fn open_fid(proc: &File, path: &File, p9_flags: u32) -> io::Result<File> {
         flags |= libc::O_RDONLY;
     }
 
-    // Safe because this doesn't modify any memory and we check the return value. We need to
-    // clear the O_NOFOLLOW flag because we want to follow the proc symlink.
-    let fd = syscall!(unsafe {
-        openat64(
-            proc.as_raw_fd(),
-            pathname.as_ptr(),
-            flags & !libc::O_NOFOLLOW,
-        )
-    })?;
+    // Re-open the file that `path` refers to with the requested flags.
+    //
+    // Linux: /proc/self/fd/N is a symlink to the real path, so openat() on it
+    //        opens the original file with new flags regardless of how N was opened.
+    // macOS: /dev/fd/N just dups fd N (preserving access mode), so we must use
+    //        fcntl(F_GETPATH) to resolve the real path first.
+    #[cfg(not(target_os = "macos"))]
+    let fd = {
+        let pathname = string_to_cstring(fd_path(path.as_raw_fd()))?;
+        syscall!(unsafe {
+            openat64(
+                proc.as_raw_fd(),
+                pathname.as_ptr(),
+                flags & !libc::O_NOFOLLOW,
+            )
+        })?
+    };
 
-    // Safe because we just opened this fd and we know it is valid.
+    #[cfg(target_os = "macos")]
+    let fd = {
+        let mut pathbuf = [0u8; libc::PATH_MAX as usize];
+        let ret = unsafe { libc::fcntl(path.as_raw_fd(), libc::F_GETPATH, pathbuf.as_mut_ptr()) };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let pathname = unsafe { CStr::from_ptr(pathbuf.as_ptr() as *const _) };
+        syscall!(unsafe {
+            libc::open(pathname.as_ptr(), flags & !libc::O_NOFOLLOW)
+        })?
+    };
+
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
@@ -636,7 +664,7 @@ impl Server {
                     openat64(
                         libc::AT_FDCWD,
                         root.as_ptr(),
-                        O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                        o_path_flags(),
                     )
                 })?;
 
@@ -801,9 +829,17 @@ impl Server {
             bavail: out.f_bavail,
             files: out.f_files,
             ffree: out.f_ffree,
-            // Safe because the fsid has only integer fields and the compiler will verify that is
-            // the same width as the `fsid` field in Rstatfs.
-            fsid: unsafe { mem::transmute::<fsid_t, u64>(out.f_fsid) },
+            // Convert fsid to u64. fsid_t layout varies by platform:
+            // Linux: { __val: [i32; 2] }, macOS: { val: [i32; 2] }
+            // Combine both halves into a single u64 for the 9P protocol.
+            fsid: {
+                let bytes = unsafe { &*(&out.f_fsid as *const _ as *const [u8; std::mem::size_of::<fsid_t>()]) };
+                let mut val = 0u64;
+                for (i, &b) in bytes.iter().enumerate().take(8) {
+                    val |= (b as u64) << (i * 8);
+                }
+                val
+            },
             #[cfg(not(target_os = "macos"))]
             namelen: out.f_namelen as u32,
             #[cfg(target_os = "macos")]
@@ -890,7 +926,9 @@ impl Server {
 
         let mut link = vec![0; libc::PATH_MAX as usize];
 
-        // Safe because this will only modify `link` and we check the return value.
+        // Linux: readlinkat(fd, "", ...) with empty path reads the symlink the fd refers to.
+        // macOS: empty path doesn't work; use /dev/fd/N path instead.
+        #[cfg(not(target_os = "macos"))]
         let len = syscall!(unsafe {
             libc::readlinkat(
                 fid.path.as_raw_fd(),
@@ -899,6 +937,20 @@ impl Server {
                 link.len(),
             )
         })? as usize;
+
+        #[cfg(target_os = "macos")]
+        let len = {
+            let path = string_to_cstring(fd_path(fid.path.as_raw_fd()))?;
+            syscall!(unsafe {
+                libc::readlinkat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    link.as_mut_ptr() as *mut libc::c_char,
+                    link.len(),
+                )
+            })? as usize
+        };
+
         link.truncate(len);
         let target = P9String::new(link)?;
         Ok(Rreadlink { target })
