@@ -353,6 +353,9 @@ impl Worker {
                         }
                     }
                 }
+                vsock_op::VIRTIO_VSOCK_OP_RST => {
+                    self.handle_op_shutdown(&hdr);
+                }
                 vsock_op::VIRTIO_VSOCK_OP_SHUTDOWN => {
                     self.handle_op_shutdown(&hdr);
                 }
