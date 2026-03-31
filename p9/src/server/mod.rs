@@ -965,6 +965,7 @@ impl Server {
         Ok(Rgetattr {
             valid: P9_GETATTR_BASIC,
             qid: st.into(),
+            // st_mode is u16 on macOS, u32 on Linux; 9P uses u32.
             mode: st.st_mode as u32,
             uid: map_id_from_host(&self.cfg.uid_map, st.st_uid),
             gid: map_id_from_host(&self.cfg.gid_map, st.st_gid),
@@ -1110,6 +1111,8 @@ impl Server {
         }
         .byte_size();
         let count = min(self.cfg.msize - header_size, readdir.count);
+        // Note: allocates per readdir request. Acceptable for typical workloads;
+        // a buffer pool could optimize if profiling shows this as a bottleneck.
         let mut cursor = Cursor::new(Vec::with_capacity(count as usize));
 
         let dir = fid.file.as_mut().ok_or_else(ebadf)?;

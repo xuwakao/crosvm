@@ -649,4 +649,8 @@ tempfile = "3"
 audio_streams = { path = "common/audio_streams" }
 libcras = { path = "libcras_stub" } # ignored by ebuild
 minijail = { path = "third_party/minijail/rust/minijail" } # ignored by ebuild
-p9 = { path = "p9" } # patched for macOS compatibility (stat64→stat, readdir64→readdir)
+# p9 crate patched for macOS: stat64→stat, readdir64→readdir, /proc→/dev,
+# O_PATH shimmed, AT_EMPTY_PATH→fstat, open_fid via fcntl(F_GETPATH).
+# This patch applies to ALL platforms (including Linux) but only affects
+# codepaths gated by #[cfg(target_os = "macos")].
+p9 = { path = "p9" }

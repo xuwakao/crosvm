@@ -49,8 +49,14 @@ impl ReadDir {
         #[cfg(target_os = "macos")]
         let d_off = unsafe { libc::telldir(self.dir) } as u64;
 
-        let d_name: &[u8] = unsafe { std::mem::transmute((*dirent).d_name.as_ref()) };
-        let name = match P9String::new(strip_padding(d_name)) {
+        // Use strlen to get the actual name length instead of transmuting the
+        // full fixed-size d_name array (avoids panic if no null terminator).
+        let d_name: &[u8] = unsafe {
+            let ptr = (*dirent).d_name.as_ptr() as *const u8;
+            let len = libc::strlen(ptr as *const libc::c_char);
+            std::slice::from_raw_parts(ptr, len)
+        };
+        let name = match P9String::new(d_name) {
             Ok(name) => name,
             Err(e) => return Some(Err(e)),
         };

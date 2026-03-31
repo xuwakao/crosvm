@@ -347,6 +347,9 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
 
         // 9P filesystem sharing: share host directory with guest VM.
         // Guest mounts via: mount -t 9p -o trans=virtio,version=9p2000.L host_share /mnt
+        // WARNING: The 9P server runs without sandboxing on macOS. The guest can
+        // access any file within the shared directory tree. Do not share sensitive
+        // directories (/, /etc, /Users) without understanding the security implications.
         let share_path = std::env::var("AETHERIA_SHARE")
             .unwrap_or_else(|_| "/private/tmp/aetheria-share".to_string());
         // Resolve symlinks (macOS /tmp → /private/tmp) so p9 server can open the dir.
