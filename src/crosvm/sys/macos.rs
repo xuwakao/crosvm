@@ -302,6 +302,49 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             }
         }
 
+        // Vsock device: enables host↔guest communication via AF_VSOCK sockets.
+        // CID 3 is conventional for the first guest VM (2 = host, 0/1 = reserved).
+        {
+            use devices::virtio;
+            use devices::virtio::vsock::{Vsock as VsockDevice, VsockConfig};
+            use vm_control::api::VmMemoryClient;
+            let vsock_cid: u64 = 3;
+            match VsockDevice::new(vsock_cid, virtio::base_features(ProtectionType::Unprotected)) {
+                Ok(vsock_dev) => {
+                    let (_msi_tube, msi_device_tube) =
+                        Tube::pair().context("vsock MSI tube")?;
+                    let (ioevent_tube, ioevent_device_tube) =
+                        Tube::pair().context("vsock ioevent tube")?;
+                    let (_vm_tube, vm_device_tube) =
+                        Tube::pair().context("vsock vm tube")?;
+                    std::mem::forget(_msi_tube);
+                    std::mem::forget(ioevent_tube);
+                    std::mem::forget(_vm_tube);
+
+                    match VirtioPciDevice::new(
+                        guest_mem_for_pci.clone(),
+                        Box::new(vsock_dev),
+                        msi_device_tube,
+                        false,
+                        None,
+                        VmMemoryClient::new_noop_ioevent(ioevent_device_tube),
+                        vm_device_tube,
+                    ) {
+                        Ok(pci_dev) => {
+                            devices.push((Box::new(pci_dev) as Box<dyn BusDeviceObj>, None));
+                            info!("virtio-vsock device created (cid={})", vsock_cid);
+                        }
+                        Err(e) => {
+                            info!("virtio-vsock PCI wrap failed: {:#}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    info!("virtio-vsock creation failed: {:#}", e);
+                }
+            }
+        }
+
         let mut vcpu_ids: Vec<usize> = (0..vcpu_count).collect();
 
         info!("Building VM with Arch::build_vm...");
