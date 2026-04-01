@@ -354,6 +354,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         let share_path = std::fs::canonicalize(&share_path)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or(share_path);
+        let mut fs_control_tube: Option<Tube> = None;
         if std::path::Path::new(&share_path).is_dir() {
             use devices::virtio;
             use devices::virtio::fs::{Fs, Config as FsConfig, CachePolicy};
@@ -368,7 +369,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
 
             let (fs_tube_host, fs_tube_device) =
                 Tube::pair().context("virtiofs tube")?;
-            std::mem::forget(fs_tube_host);
+            fs_control_tube = Some(fs_tube_host);
 
             match Fs::new(
                 virtio::base_features(ProtectionType::Unprotected),
@@ -387,16 +388,13 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                     // Keep ioevent host tube alive for the register_ioevent path.
                     ioevent_host_tubes.push(ioevent_host_tube_fs);
 
-                    // DAX: shared memory client for mapping file regions into guest.
-                    let (_shmem_host, shmem_device) =
-                        Tube::pair().context("fs shmem tube")?;
-
+                    // Fs device uses PCI BAR + tube for DAX, not SharedMemoryRegion.
                     match VirtioPciDevice::new(
                         guest_mem_for_pci.clone(),
                         Box::new(fs_dev),
                         msi_device_tube,
                         false,
-                        Some(VmMemoryClient::new(shmem_device)),
+                        None,
                         VmMemoryClient::new_noop_ioevent(ioevent_device_tube),
                         vm_device_tube,
                     ) {
@@ -543,20 +541,39 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         // Keep ioevent host tubes alive (noop_ioevent mode — write_bar fallback).
         let _ioevent_tubes_keepalive = ioevent_host_tubes;
 
-        // Spawn MSI handler thread — processes VmIrqRequest from VirtioPciDevice's
-        // MsixConfig to allocate MSI-X interrupt vectors. Without this, the device
-        // cannot deliver completion interrupts and the kernel hangs waiting for I/O.
+        // Wrap allocator in Arc<Mutex<>> for sharing between handler threads.
+        // This mirrors Linux's approach (src/crosvm/sys/linux.rs line 3757).
+        let sys_allocator = Arc::new(sync::Mutex::new(sys_allocator));
+
+        // Spawn MSI handler thread.
         let mut irq_chip_for_msi = irq_chip.try_box_clone()
             .context("failed to clone irq chip for MSI handler")?;
-        // Use first MSI tube (single disk). For multi-disk, would need per-device handlers.
         let msi_tube = msi_host_tubes.into_iter().next();
+        let allocator_for_msi = sys_allocator.clone();
         let msi_handler_join = if let Some(tube) = msi_tube {
             Some(thread::Builder::new()
                 .name("msi_handler".into())
                 .spawn(move || {
-                    msi_handler_thread(irq_chip_for_msi, sys_allocator, tube);
+                    msi_handler_thread(irq_chip_for_msi, allocator_for_msi, tube);
                 })
                 .context("failed to spawn MSI handler thread")?)
+        } else {
+            None
+        };
+
+        // Spawn FS mapping handler thread — processes FsMappingRequest from the
+        // virtiofs device (AllocateSharedMemoryRegion during activate(), and
+        // CreateMemoryMapping/RemoveMemoryMapping at runtime for DAX).
+        // This mirrors Linux's TaggedControlTube::Fs in run_control().
+        let fs_handler_join = if let Some(fs_tube) = fs_control_tube {
+            let vm_for_fs = linux.vm.try_clone().context("clone VM for fs handler")?;
+            let allocator_for_fs = sys_allocator.clone();
+            Some(thread::Builder::new()
+                .name("fs_handler".into())
+                .spawn(move || {
+                    fs_mapping_handler_thread(vm_for_fs, allocator_for_fs, fs_tube);
+                })
+                .context("failed to spawn fs handler thread")?)
         } else {
             None
         };
@@ -937,7 +954,7 @@ fn create_net_device(
 #[cfg(target_arch = "aarch64")]
 fn msi_handler_thread(
     mut irq_chip: Box<dyn devices::IrqChipAArch64>,
-    mut sys_allocator: SystemAllocator,
+    sys_allocator: Arc<sync::Mutex<SystemAllocator>>,
     tube: Tube,
 ) {
     use devices::IrqChip;
@@ -979,7 +996,7 @@ fn msi_handler_thread(
                             Ok(())
                         }
                     },
-                    &mut sys_allocator,
+                    &mut sys_allocator.lock(),
                 );
                 if let Err(e) = tube.send(&response) {
                     error!("MSI handler: send response failed: {}", e);
@@ -994,6 +1011,41 @@ fn msi_handler_thread(
     }
 
     info!("MSI handler thread exiting");
+}
+
+/// Handles FsMappingRequest from the virtiofs device.
+/// This is the macOS equivalent of Linux's TaggedControlTube::Fs handling
+/// in run_control(). Processes:
+/// - AllocateSharedMemoryRegion: creates the DAX window during device activate()
+/// - CreateMemoryMapping: maps file regions into DAX window (runtime)
+/// - RemoveMemoryMapping: unmaps file regions from DAX window (runtime)
+fn fs_mapping_handler_thread(
+    mut vm: impl hypervisor::Vm,
+    sys_allocator: Arc<sync::Mutex<SystemAllocator>>,
+    tube: Tube,
+) {
+    use vm_control::FsMappingRequest;
+
+    info!("FS mapping handler thread started");
+
+    loop {
+        match tube.recv::<FsMappingRequest>() {
+            Ok(request) => {
+                let response = request.execute(&mut vm, &mut sys_allocator.lock());
+                if let Err(e) = tube.send(&response) {
+                    error!("fs handler: send response failed: {}", e);
+                    break;
+                }
+            }
+            Err(e) => {
+                // Tube closed (device dropped) — normal shutdown.
+                info!("fs handler: tube closed: {}", e);
+                break;
+            }
+        }
+    }
+
+    info!("FS mapping handler thread exiting");
 }
 
 /// IRQ handler thread — polls device IRQ eventfds and routes interrupts.
