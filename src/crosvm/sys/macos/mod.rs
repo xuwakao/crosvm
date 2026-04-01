@@ -369,6 +369,14 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             // because virtiofs FUSE_NOTIFY is not supported by the Linux kernel driver.
             fs_cfg.cache_policy = CachePolicy::Auto;
             fs_cfg.timeout = std::time::Duration::from_secs(30);
+            fs_cfg.negative_timeout = std::time::Duration::from_secs(5);
+            // Writeback caching: kernel coalesces writes before sending to FUSE server.
+            // Safe here because FSEvents monitors host-side changes and forces revalidation.
+            fs_cfg.writeback = true;
+            // Don't rewrite security xattrs — no unprivileged namespace on macOS.
+            fs_cfg.rewrite_security_xattrs = false;
+            // Disable security context (no /proc/thread-self/attr/fscreate on macOS).
+            fs_cfg.security_ctx = false;
             // DAX: guest mmap → hv_vm_map → direct host file access (zero-copy).
             fs_cfg.use_dax = true;
 
