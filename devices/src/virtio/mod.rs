@@ -138,6 +138,7 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_os = "macos")] {
         mod p9;
         pub use self::p9::P9;
+        pub mod fs;
     } else {
         compile_error!("Unsupported platform");
     }
