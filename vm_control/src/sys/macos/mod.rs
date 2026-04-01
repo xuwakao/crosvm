@@ -139,6 +139,21 @@ pub fn prepare_shared_memory_region(
                 Some(v) => v,
                 None => return Err(SysError::new(ERANGE)),
             };
+
+            // On macOS/HVF, do NOT pre-map the entire DAX window into guest
+            // address space. HVF does not support partial remapping within a
+            // larger mapped region — hv_vm_map returns HV_BAD_PARAMETER when
+            // trying to map over any portion of an existing mapping, even after
+            // hv_vm_unmap of that sub-region.
+            //
+            // Instead, register the region in mem_regions for guest address
+            // tracking (so add_fd_mapping can compute guest physical addresses),
+            // but use MemCacheType::CacheNonCoherent as a signal to HvfVm to
+            // skip the hv_vm_map call. File-backed pages are mapped on demand
+            // by add_fd_mapping when the guest accesses DAX files.
+            //
+            // On Linux/KVM, pre-mapping works because KVM supports replacing
+            // the host backing of sub-regions via KVM_SET_USER_MEMORY_REGION.
             let arena = match MemoryMappingArena::new(size) {
                 Ok(a) => a,
                 Err(MmapError::SystemCallFailed(e)) => return Err(e),
@@ -150,7 +165,7 @@ pub fn prepare_shared_memory_region(
                 Box::new(arena),
                 false,
                 false,
-                cache,
+                MemCacheType::CacheNonCoherent,
             ) {
                 Ok(slot) => Ok(VmMappedMemoryRegion {
                     guest_address: GuestAddress(range.start),

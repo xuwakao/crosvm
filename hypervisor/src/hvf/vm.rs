@@ -263,28 +263,42 @@ impl Vm for HvfVm {
         mem_region: Box<dyn MappedRegion>,
         read_only: bool,
         _log_dirty_pages: bool,
-        _cache: MemCacheType,
+        cache: MemCacheType,
     ) -> Result<MemSlot> {
         let size = mem_region.size();
         let host_addr = mem_region.as_ptr() as *const std::ffi::c_void;
 
-        let mut flags = ffi::HV_MEMORY_READ;
-        if !read_only {
-            flags |= ffi::HV_MEMORY_WRITE;
-        }
-        flags |= ffi::HV_MEMORY_EXEC;
+        // CacheNonCoherent is used as a signal from prepare_shared_memory_region
+        // to register the DAX window in mem_regions for address tracking WITHOUT
+        // actually mapping it into guest IPA space via hv_vm_map. HVF does not
+        // support partial remapping within a larger mapping, so the DAX window
+        // must be mapped on-demand by add_fd_mapping, not pre-mapped here.
+        let skip_mapping = cache == MemCacheType::CacheNonCoherent;
 
-        base::info!(
-            "HvfVm::add_memory_region: guest={:#x} size={:#x} host={:p} flags={:#x}",
-            guest_addr.0, size, host_addr, flags
-        );
+        if !skip_mapping {
+            let mut flags = ffi::HV_MEMORY_READ;
+            if !read_only {
+                flags |= ffi::HV_MEMORY_WRITE;
+            }
+            flags |= ffi::HV_MEMORY_EXEC;
 
-        // SAFETY: host_addr points to a valid mapped region of `size` bytes.
-        let ret = unsafe { ffi::hv_vm_map(host_addr, guest_addr.0, size, flags) };
-        if ret != ffi::HV_SUCCESS {
-            base::error!("hv_vm_map failed: ret={}", ret);
+            base::info!(
+                "HvfVm::add_memory_region: guest={:#x} size={:#x} host={:p} flags={:#x}",
+                guest_addr.0, size, host_addr, flags
+            );
+
+            // SAFETY: host_addr points to a valid mapped region of `size` bytes.
+            let ret = unsafe { ffi::hv_vm_map(host_addr, guest_addr.0, size, flags) };
+            if ret != ffi::HV_SUCCESS {
+                base::error!("hv_vm_map failed: ret={}", ret);
+            }
+            hvf_result(ret)?;
+        } else {
+            base::info!(
+                "HvfVm::add_memory_region (DAX, skip hv_vm_map): guest={:#x} size={:#x}",
+                guest_addr.0, size
+            );
         }
-        hvf_result(ret)?;
 
         let mut slot_lock = self.next_mem_slot.lock();
         let slot = *slot_lock;
@@ -382,19 +396,51 @@ impl Vm for HvfVm {
             mmap_prot |= libc::PROT_WRITE;
         }
 
-        // mmap the file region on the host.
+        // Allocate anonymous memory and populate it from the file.
+        //
+        // HVF's hv_vm_map rejects file-backed MAP_SHARED mappings
+        // (returns HV_BAD_PARAMETER). This is likely because HVF requires
+        // the host pages to be resident and fully-backed, which file-backed
+        // MAP_SHARED mappings beyond file EOF are not.
+        //
+        // Workaround: allocate anonymous pages, read file content via pread,
+        // then hv_vm_map the anonymous pages. This sacrifices true zero-copy
+        // DAX semantics but gives the guest a fast-path to file content without
+        // per-read FUSE round-trips. Writes are synced back via pwrite in
+        // remove_mapping.
         let host_addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 size,
-                mmap_prot,
-                libc::MAP_SHARED,
-                fd.as_raw_descriptor(),
-                fd_offset as libc::off_t,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
             )
         };
         if host_addr == libc::MAP_FAILED {
             return Err(base::Error::new(unsafe { *libc::__error() }));
+        }
+
+        // Populate from file. Read as much as available (file may be smaller
+        // than the mapping window). Remainder stays zeroed.
+        let nread = unsafe {
+            libc::pread(
+                fd.as_raw_descriptor(),
+                host_addr,
+                size,
+                fd_offset as libc::off_t,
+            )
+        };
+        if nread < 0 {
+            let err = unsafe { *libc::__error() };
+            unsafe { libc::munmap(host_addr, size) };
+            return Err(base::Error::new(err));
+        }
+
+        // Make the mapping read-only if requested (after populating).
+        if !prot.allows(&Protection::write()) {
+            unsafe { libc::mprotect(host_addr, size, libc::PROT_READ) };
         }
 
         // Find the guest physical address for this slot+offset.
@@ -411,8 +457,21 @@ impl Vm for HvfVm {
             hvf_flags |= ffi::HV_MEMORY_WRITE;
         }
 
+        // HVF requires unmapping the existing region before remapping.
+        // prepare_shared_memory_region() pre-maps a large anonymous arena
+        // at the DAX window's guest address. We must unmap the specific
+        // sub-range before mapping file-backed memory over it.
+        // If this sub-region was previously mapped (e.g., remapping a different
+        // file), unmap it first. Ignore errors (unmapping a never-mapped region
+        // returns HV_BAD_PARAMETER, which is expected on first use).
+        unsafe { ffi::hv_vm_unmap(guest_addr, size) };
+
         let ret = unsafe { ffi::hv_vm_map(host_addr as *const _, guest_addr, size, hvf_flags) };
         if ret != ffi::HV_SUCCESS {
+            base::error!(
+                "DAX hv_vm_map FAILED: ret={:#x} host={:?} guest={:#x} size={:#x} flags={:#x}",
+                ret, host_addr, guest_addr, size, hvf_flags
+            );
             unsafe { libc::munmap(host_addr, size) };
             return Err(base::Error::new(libc::EIO));
         }
