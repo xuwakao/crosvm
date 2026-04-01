@@ -155,7 +155,6 @@ fn process_fs_queue<F: FileSystem + Sync>(
         let read_bytes = avail_desc.reader.available_bytes();
         match server.handle_message(&mut avail_desc.reader, &mut avail_desc.writer, &mapper) {
             Ok(total) => {
-                base::info!("virtiofs: processed FUSE msg, read={}, response={}", read_bytes, total);
                 queue.add_used_with_bytes_written(avail_desc, total as u32);
                 queue.trigger_interrupt();
             }
@@ -239,7 +238,6 @@ impl<F: FileSystem + Sync> Worker<F> {
             for event in events.iter().filter(|e| e.is_readable) {
                 match event.token {
                     Token::QueueReady => {
-                        base::info!("virtiofs: QueueReady event received!");
                         self.queue.event().wait().map_err(Error::ReadQueueEvent)?;
                         if let Err(e) =
                             process_fs_queue(&mut self.queue, &self.server, &self.tube, self.slot)

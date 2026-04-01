@@ -936,12 +936,6 @@ impl PciDevice for VirtioPciDevice {
                 NOTIFICATION_BAR_OFFSET..=NOTIFICATION_LAST => {
                     let queue_index = (offset - NOTIFICATION_BAR_OFFSET) as usize
                         / NOTIFY_OFF_MULTIPLIER as usize;
-                    // Log the first few notifications per device for debugging.
-                    static NOTIFY_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    let cnt = NOTIFY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if cnt < 20 {
-                        base::info!("PCI notify: queue_index={}, offset={:#x}, evts_len={}", queue_index, offset, self.queue_evts.len());
-                    }
                     if let Some(evt) = self.queue_evts.get(queue_index) {
                         if let Err(e) = evt.event.signal() {
                             base::error!("notification fallback signal error for q{}: {}", queue_index, e);

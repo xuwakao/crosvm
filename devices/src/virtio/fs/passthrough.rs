@@ -2530,7 +2530,6 @@ impl FileSystem for PassthroughFs {
     }
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
-        base::info!("virtiofs: lookup(parent={}, name={:?})", parent, name);
         let data = self.find_inode(parent)?;
         #[allow(unused_variables)]
         let path = format!(
