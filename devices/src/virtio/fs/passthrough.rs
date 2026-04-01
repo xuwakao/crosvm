@@ -159,19 +159,43 @@ mod compat {
         libc::fcntl(fd, libc::F_FULLFSYNC)
     }
 
+    // macOS errno translation: ENOATTR (93 on macOS) → ENODATA (61 on Linux).
+    // Without this, the guest sees errno 93 as ENOPROTOOPT ("Protocol not supported")
+    // which breaks virtiofs mount because GETXATTR for security.* attrs fails fatally.
+    const MACOS_ENOATTR: libc::c_int = 93;
+    const LINUX_ENODATA: libc::c_int = 61;
+
+    /// /proc/self/fd/N path relative to PROC_CSTR root.
+    /// Linux: "self/fd/{fd}" (relative to /proc)
+    /// macOS: "fd/{fd}" (relative to /dev)
+    pub fn fd_proc_path(fd: i32) -> String {
+        format!("fd/{fd}")
+    }
+
+    fn translate_xattr_errno() {
+        unsafe {
+            if *libc::__error() == MACOS_ENOATTR {
+                *libc::__error() = LINUX_ENODATA;
+            }
+        }
+    }
+
     // macOS xattr API has extra `position` and `options` parameters.
-    // Wrap to match Linux's simpler 4/5-arg signatures.
     pub unsafe fn getxattr(
         path: *const libc::c_char, name: *const libc::c_char,
         value: *mut libc::c_void, size: libc::size_t,
     ) -> libc::ssize_t {
-        libc::getxattr(path, name, value, size, 0, 0)
+        let r = libc::getxattr(path, name, value, size, 0, 0);
+        if r < 0 { translate_xattr_errno(); }
+        r
     }
     pub unsafe fn fgetxattr(
         fd: libc::c_int, name: *const libc::c_char,
         value: *mut libc::c_void, size: libc::size_t,
     ) -> libc::ssize_t {
-        libc::fgetxattr(fd, name, value, size, 0, 0)
+        let r = libc::fgetxattr(fd, name, value, size, 0, 0);
+        if r < 0 { translate_xattr_errno(); }
+        r
     }
     pub unsafe fn setxattr(
         path: *const libc::c_char, name: *const libc::c_char,
@@ -188,12 +212,16 @@ mod compat {
     pub unsafe fn listxattr(
         path: *const libc::c_char, list: *mut libc::c_char, size: libc::size_t,
     ) -> libc::ssize_t {
-        libc::listxattr(path, list, size, 0)
+        let r = libc::listxattr(path, list, size, 0);
+        if r < 0 { translate_xattr_errno(); }
+        r
     }
     pub unsafe fn flistxattr(
         fd: libc::c_int, list: *mut libc::c_char, size: libc::size_t,
     ) -> libc::ssize_t {
-        libc::flistxattr(fd, list, size, 0)
+        let r = libc::flistxattr(fd, list, size, 0);
+        if r < 0 { translate_xattr_errno(); }
+        r
     }
     pub unsafe fn removexattr(
         path: *const libc::c_char, name: *const libc::c_char,
@@ -220,6 +248,11 @@ use libc::{
 };
 
 const EMPTY_CSTR: &CStr = c"";
+
+#[cfg(not(target_os = "macos"))]
+fn fd_proc_path(fd: i32) -> String {
+    fd_proc_path(fd as i32)
+}
 
 #[cfg(not(target_os = "macos"))]
 const PROC_CSTR: &CStr = c"/proc";
@@ -1136,22 +1169,42 @@ impl PassthroughFs {
     }
 
     fn open_fd(&self, fd: RawDescriptor, flags: i32) -> io::Result<File> {
-        let pathname = CString::new(format!("self/fd/{fd}"))
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        // Re-open the file that `fd` refers to with the requested flags.
+        //
+        // Linux: /proc/self/fd/N is a symlink to the real path. openat on it
+        //        opens the original file with new flags.
+        // macOS: /dev/fd/N just dups fd (preserving access mode). Must use
+        //        fcntl(F_GETPATH) to resolve real path, then open that.
+        #[cfg(not(target_os = "macos"))]
+        let raw_descriptor = {
+            let pathname = CString::new(fd_proc_path(fd as i32))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            syscall!(unsafe {
+                openat64(
+                    self.proc.as_raw_descriptor(),
+                    pathname.as_ptr(),
+                    (flags | libc::O_CLOEXEC) & !(libc::O_NOFOLLOW | O_DIRECT),
+                )
+            })?
+        };
 
-        // SAFETY: this doesn't modify any memory and we check the return value. We don't really
-        // check `flags` because if the kernel can't handle poorly specified flags then we have
-        // much bigger problems. Also, clear the `O_NOFOLLOW` flag if it is set since we need
-        // to follow the `/proc/self/fd` symlink to get the file.
-        let raw_descriptor = syscall!(unsafe {
-            openat64(
-                self.proc.as_raw_descriptor(),
-                pathname.as_ptr(),
-                (flags | libc::O_CLOEXEC) & !(libc::O_NOFOLLOW | O_DIRECT),
-            )
-        })?;
+        #[cfg(target_os = "macos")]
+        let raw_descriptor = {
+            let mut pathbuf = [0u8; libc::PATH_MAX as usize];
+            let ret = unsafe { libc::fcntl(fd, libc::F_GETPATH, pathbuf.as_mut_ptr()) };
+            if ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            pathbuf[libc::PATH_MAX as usize - 1] = 0;
+            let pathname = unsafe { std::ffi::CStr::from_ptr(pathbuf.as_ptr() as *const _) };
+            syscall!(unsafe {
+                libc::open(
+                    pathname.as_ptr(),
+                    (flags | libc::O_CLOEXEC) & !O_DIRECT,
+                )
+            })?
+        };
 
-        // SAFETY: safe because we just opened this descriptor.
         Ok(unsafe { File::from_raw_descriptor(raw_descriptor) })
     }
 
@@ -1547,7 +1600,7 @@ impl PassthroughFs {
             // For FDs opened with `O_PATH`, we cannot call `fgetxattr` normally. Instead we
             // emulate an _at syscall by changing the CWD to /proc, running the path based syscall,
             //  and then setting the CWD back to the root directory.
-            let path = CString::new(format!("self/fd/{}", file.as_raw_descriptor()))
+            let path = CString::new(fd_proc_path(file.as_raw_descriptor() as i32))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             // SAFETY: this will only modify `value` and we check the return value.
@@ -2496,6 +2549,7 @@ impl FileSystem for PassthroughFs {
     }
 
     fn lookup(&self, _ctx: Context, parent: Inode, name: &CStr) -> io::Result<Entry> {
+        base::info!("virtiofs: lookup(parent={}, name={:?})", parent, name);
         let data = self.find_inode(parent)?;
         #[allow(unused_variables)]
         let path = format!(
@@ -2657,7 +2711,11 @@ impl FileSystem for PassthroughFs {
             Err(io::Error::from_raw_os_error(libc::ENOSYS))
         } else {
             let _trace = fs_trace!(self.tag, "open", inode, flags);
-            self.do_open(inode, flags)
+            let result = self.do_open(inode, flags);
+            if let Err(ref e) = result {
+                base::error!("virtiofs: open(inode={}, flags={:#x}) failed: {}", inode, flags, e);
+            }
+            result
         }
     }
 
@@ -2975,7 +3033,7 @@ impl FileSystem for PassthroughFs {
             hd = self.find_handle(handle, inode)?;
             Data::Handle(hd.file.lock())
         } else {
-            let pathname = CString::new(format!("self/fd/{}", inode_data.as_raw_descriptor()))
+            let pathname = CString::new(fd_proc_path(inode_data.as_raw_descriptor() as i32))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             Data::ProcPath(pathname)
         };
@@ -3195,7 +3253,7 @@ impl FileSystem for PassthroughFs {
         let data = self.find_inode(inode)?;
         let new_inode = self.find_inode(newparent)?;
 
-        let path = CString::new(format!("self/fd/{}", data.as_raw_descriptor()))
+        let path = CString::new(fd_proc_path(data.as_raw_descriptor() as i32))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         {
@@ -3433,7 +3491,7 @@ impl FileSystem for PassthroughFs {
             // For FDs opened with `O_PATH`, we cannot call `fsetxattr` normally. Instead we emulate
             // an _at syscall by changing the CWD to /proc, running the path based syscall, and then
             // setting the CWD back to the root directory.
-            let path = CString::new(format!("self/fd/{}", file.as_raw_descriptor()))
+            let path = CString::new(fd_proc_path(file.as_raw_descriptor() as i32))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             syscall!(self.with_proc_chdir(|| {
@@ -3511,7 +3569,7 @@ impl FileSystem for PassthroughFs {
             // For FDs opened with `O_PATH`, we cannot call `flistxattr` normally. Instead we
             // emulate an _at syscall by changing the CWD to /proc, running the path based syscall,
             // and then setting the CWD back to the root directory.
-            let path = CString::new(format!("self/fd/{}", file.as_raw_descriptor()))
+            let path = CString::new(fd_proc_path(file.as_raw_descriptor() as i32))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             // SAFETY: this will only modify `buf` and we check the return value.
@@ -3563,7 +3621,7 @@ impl FileSystem for PassthroughFs {
             // For files opened with `O_PATH`, we cannot call `fremovexattr` normally. Instead we
             // emulate an _at syscall by changing the CWD to /proc, running the path based syscall,
             // and then setting the CWD back to the root directory.
-            let path = CString::new(format!("self/fd/{}", file.as_raw_descriptor()))
+            let path = CString::new(fd_proc_path(file.as_raw_descriptor() as i32))
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
             syscall!(self.with_proc_chdir(||

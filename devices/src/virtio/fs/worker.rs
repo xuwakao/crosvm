@@ -161,7 +161,7 @@ fn process_fs_queue<F: FileSystem + Sync>(
             }
             Err(e) => {
                 base::error!("virtiofs: FUSE msg error: {:?}", e);
-                return Err(e);
+                return Err(e.into());
             }
         }
     }

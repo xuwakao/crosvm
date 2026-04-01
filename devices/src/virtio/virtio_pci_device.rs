@@ -934,18 +934,20 @@ impl PciDevice for VirtioPciDevice {
                         .write_config(offset - DEVICE_CONFIG_BAR_OFFSET, data);
                 }
                 NOTIFICATION_BAR_OFFSET..=NOTIFICATION_LAST => {
-                    // Notifications are normally handled with ioevents inside the hypervisor and
-                    // do not reach write_bar(). However, if the ioevent registration hasn't
-                    // finished yet, it is possible for a write to the notification region to make
-                    // it through as a normal MMIO exit and end up here. To handle that case,
-                    // provide a fallback that looks up the corresponding queue for the offset and
-                    // triggers its event, which is equivalent to what the ioevent would do.
                     let queue_index = (offset - NOTIFICATION_BAR_OFFSET) as usize
                         / NOTIFY_OFF_MULTIPLIER as usize;
+                    // Log the first few notifications per device for debugging.
+                    static NOTIFY_LOG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let cnt = NOTIFY_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if cnt < 20 {
+                        base::info!("PCI notify: queue_index={}, offset={:#x}, evts_len={}", queue_index, offset, self.queue_evts.len());
+                    }
                     if let Some(evt) = self.queue_evts.get(queue_index) {
                         if let Err(e) = evt.event.signal() {
                             base::error!("notification fallback signal error for q{}: {}", queue_index, e);
                         }
+                    } else {
+                        base::warn!("notification for unknown queue_index={}", queue_index);
                     }
                 }
                 MSIX_TABLE_BAR_OFFSET..=MSIX_TABLE_LAST => {

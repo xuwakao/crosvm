@@ -159,6 +159,7 @@ impl<F: FileSystem + Sync> Server<F> {
         mapper: M,
     ) -> Result<usize> {
         let in_header: InHeader = r.read_struct()?;
+        base::info!("fuse: opcode={} ({:?}) len={} unique={}", in_header.opcode, Opcode::n(in_header.opcode), in_header.len, in_header.unique);
         cros_tracing::trace_simple_print!("fuse server: handle_message: in_header={:?}", in_header);
 
         if in_header.len
