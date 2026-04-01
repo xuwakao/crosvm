@@ -399,15 +399,14 @@ impl Vm for HvfVm {
         // Allocate anonymous memory and populate it from the file.
         //
         // HVF's hv_vm_map rejects file-backed MAP_SHARED mappings
-        // (returns HV_BAD_PARAMETER). This is likely because HVF requires
-        // the host pages to be resident and fully-backed, which file-backed
-        // MAP_SHARED mappings beyond file EOF are not.
+        // (returns HV_BAD_PARAMETER). Workaround: allocate anonymous pages,
+        // populate via pread, then hv_vm_map. This sacrifices true zero-copy
+        // DAX but gives the guest a fast-path without per-read FUSE round-trips.
         //
-        // Workaround: allocate anonymous pages, read file content via pread,
-        // then hv_vm_map the anonymous pages. This sacrifices true zero-copy
-        // DAX semantics but gives the guest a fast-path to file content without
-        // per-read FUSE round-trips. Writes are synced back via pwrite in
-        // remove_mapping.
+        // Limitation: writable mappings use COW pages. Guest writes do NOT
+        // propagate back to the host file. Writeback caching is disabled on
+        // macOS to prevent silent data loss. Reads are always fresh at mapping
+        // time (pread from file), but the snapshot is immutable once mapped.
         let host_addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -445,9 +444,15 @@ impl Vm for HvfVm {
 
         // Find the guest physical address for this slot+offset.
         let mem_regions = self.mem_regions.lock();
-        let (guest_base, _) = mem_regions
+        let (guest_base, mem_region) = mem_regions
             .get(&slot)
             .ok_or(base::Error::new(libc::EINVAL))?;
+        // Bounds check: mapping must fit within the registered DAX window.
+        if offset.checked_add(size).map_or(true, |end| end > mem_region.size()) {
+            drop(mem_regions);
+            unsafe { libc::munmap(host_addr, size) };
+            return Err(base::Error::new(libc::EINVAL));
+        }
         let guest_addr = guest_base.0 + offset as u64;
         drop(mem_regions);
 

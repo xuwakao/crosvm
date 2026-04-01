@@ -370,9 +370,11 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             fs_cfg.cache_policy = CachePolicy::Auto;
             fs_cfg.timeout = std::time::Duration::from_secs(30);
             fs_cfg.negative_timeout = std::time::Duration::from_secs(5);
-            // Writeback caching: kernel coalesces writes before sending to FUSE server.
-            // Safe here because FSEvents monitors host-side changes and forces revalidation.
-            fs_cfg.writeback = true;
+            // Writeback caching DISABLED: DAX on HVF uses anonymous mmap + pread
+            // (MAP_SHARED rejected by hv_vm_map). Guest writes to DAX pages are COW
+            // and never reach the file. Until write-back is implemented, writeback
+            // must be off to avoid silent data loss.
+            fs_cfg.writeback = false;
             // Don't rewrite security xattrs — no unprivileged namespace on macOS.
             fs_cfg.rewrite_security_xattrs = false;
             // Disable security context (no /proc/thread-self/attr/fscreate on macOS).
@@ -872,6 +874,9 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
         // (which happens when the vCPU loop exits and devices are cleaned up).
         drop(_ioevent_tubes_keepalive);
         if let Some(join) = msi_handler_join {
+            let _ = join.join();
+        }
+        if let Some(join) = fs_handler_join {
             let _ = join.join();
         }
 
