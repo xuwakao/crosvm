@@ -11,5 +11,9 @@ cfg_if::cfg_if! {
         pub(crate) mod windows;
         pub use windows::WinGpuDisplayExt as SysGpuDisplayExt;
         pub(crate) use windows::WinDisplayT as SysDisplayT;
+    } else if #[cfg(target_os = "macos")] {
+        pub(crate) mod macos;
+        pub use macos::MacosGpuDisplayExt as SysGpuDisplayExt;
+        pub(crate) use macos::MacosDisplayT as SysDisplayT;
     }
 }

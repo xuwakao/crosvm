@@ -23,6 +23,10 @@ cfg_if::cfg_if! {
         pub mod macos;
         use macos as platform;
         pub use platform::{VmMemoryMappingRequest, VmMemoryMappingResponse, FsMappingRequest};
+        #[cfg(feature = "gpu")]
+        pub use platform::gpu::MacosDisplayMode as DisplayMode;
+        #[cfg(feature = "gpu")]
+        pub use platform::gpu::MacosMouseMode as MouseMode;
     } else {
         compile_error!("Unsupported platform");
     }
