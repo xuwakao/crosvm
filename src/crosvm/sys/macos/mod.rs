@@ -3,6 +3,8 @@
 
 pub mod cmdline;
 pub mod config;
+#[cfg(feature = "gpu")]
+pub mod gpu;
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -398,6 +400,64 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 }
                 Err(e) => {
                     info!("virtio-9p creation failed: {}", e);
+                }
+            }
+        }
+
+        // GPU device: virtio-gpu with Rutabaga2D software backend.
+        // Provides /dev/dri/card0 in guest for Mesa software rendering.
+        #[cfg(feature = "gpu")]
+        {
+            use devices::virtio;
+            use devices::virtio::gpu::{DisplayBackend, Gpu, GpuParameters};
+            use vm_control::api::VmMemoryClient;
+
+            let gpu_params = GpuParameters::default();
+            let (gpu_ctrl_host, gpu_ctrl_device) =
+                Tube::pair().context("gpu control tube")?;
+            let (msi_tube, msi_device_tube) =
+                Tube::pair().context("gpu MSI tube")?;
+            let (ioevent_tube, ioevent_device_tube) =
+                Tube::pair().context("gpu ioevent tube")?;
+            let (vm_tube, vm_device_tube) =
+                Tube::pair().context("gpu vm tube")?;
+            std::mem::forget(msi_tube);
+            std::mem::forget(ioevent_tube);
+            std::mem::forget(vm_tube);
+            std::mem::forget(gpu_ctrl_host);
+
+            let gpu_dev = Gpu::new(
+                vm_evt_wrtube.try_clone().context("clone vm_evt for gpu")?,
+                gpu_ctrl_device,
+                Vec::new(),       // resource_bridges
+                vec![DisplayBackend::Stub],
+                &gpu_params,
+                None,             // rutabaga_server_descriptor
+                Vec::new(),       // event_devices
+                virtio::base_features(ProtectionType::Unprotected),
+                &BTreeMap::new(), // paths
+            );
+
+            // GPU has shared memory regions — need a real VmMemoryClient, not None.
+            let (shmem_host_tube, shmem_device_tube) =
+                Tube::pair().context("gpu shmem tube")?;
+            std::mem::forget(shmem_host_tube);
+
+            match VirtioPciDevice::new(
+                guest_mem_for_pci.clone(),
+                Box::new(gpu_dev),
+                msi_device_tube,
+                false,
+                Some(VmMemoryClient::new(shmem_device_tube)),
+                VmMemoryClient::new_noop_ioevent(ioevent_device_tube),
+                vm_device_tube,
+            ) {
+                Ok(pci_dev) => {
+                    devices.push((Box::new(pci_dev) as Box<dyn BusDeviceObj>, None));
+                    info!("virtio-gpu device created (Rutabaga2D stub display)");
+                }
+                Err(e) => {
+                    info!("virtio-gpu PCI wrap failed: {:#}", e);
                 }
             }
         }

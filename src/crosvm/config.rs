@@ -82,6 +82,9 @@ cfg_if::cfg_if! {
 
         #[cfg(target_arch = "aarch64")]
         static VHOST_SCMI_PATH: &str = "/dev/vhost-scmi";
+    } else if #[cfg(target_os = "macos")] {
+        #[cfg(feature = "gpu")]
+        use crate::crosvm::sys::GpuRenderServerParameters;
     } else if #[cfg(windows)] {
         use base::{Event, Tube};
     }

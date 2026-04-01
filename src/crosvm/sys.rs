@@ -23,6 +23,8 @@ cfg_if::cfg_if! {
         compile_error!("pci-hotplug not supported on windows");
     } else if #[cfg(target_os = "macos")] {
         use macos as platform;
+        #[cfg(feature = "gpu")]
+        pub(crate) use macos::gpu::GpuRenderServerParameters;
     } else {
         compile_error!("Unsupported platform");
     }
