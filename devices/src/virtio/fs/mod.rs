@@ -205,10 +205,12 @@ impl VirtioDevice for Fs {
     }
 
     fn features(&self) -> u64 {
+        base::info!("virtiofs: features() = {:#x}", self.avail_features);
         self.avail_features
     }
 
     fn ack_features(&mut self, mut v: u64) {
+        base::info!("virtiofs: ack_features({:#x})", v);
         // Check if the guest is ACK'ing a feature that we didn't claim to have.
         let unrequested_features = v & !self.avail_features;
         if unrequested_features != 0 {
@@ -230,6 +232,10 @@ impl VirtioDevice for Fs {
         _interrupt: Interrupt,
         queues: BTreeMap<usize, Queue>,
     ) -> anyhow::Result<()> {
+        base::info!(
+            "virtiofs: activate called, queues={}, acked_features={:#x}, use_dax={}",
+            queues.len(), self.acked_features, self.use_dax
+        );
         if queues.len() != self.queue_sizes.len() {
             return Err(anyhow!(
                 "expected {} queues, got {}",

@@ -730,7 +730,9 @@ fn eexist() -> io::Error {
 fn stat<F: AsRawDescriptor + ?Sized>(f: &F) -> io::Result<stat64> {
     let mut st: MaybeUninit<stat64> = MaybeUninit::<stat64>::zeroed();
 
-    // SAFETY: the kernel will only write data in `st` and we check the return value.
+    // Linux: fstatat with AT_EMPTY_PATH stats the fd itself.
+    // macOS: AT_EMPTY_PATH doesn't exist. Use fstat directly.
+    #[cfg(not(target_os = "macos"))]
     syscall!(unsafe {
         fstatat64(
             f.as_raw_descriptor(),
@@ -740,7 +742,11 @@ fn stat<F: AsRawDescriptor + ?Sized>(f: &F) -> io::Result<stat64> {
         )
     })?;
 
-    // SAFETY: the kernel guarantees that the struct is now fully initialized.
+    #[cfg(target_os = "macos")]
+    syscall!(unsafe {
+        libc::fstat(f.as_raw_descriptor(), st.as_mut_ptr())
+    })?;
+
     Ok(unsafe { st.assume_init() })
 }
 
@@ -2998,6 +3004,8 @@ impl FileSystem for PassthroughFs {
             };
 
             // SAFETY: this doesn't modify any memory and we check the return value.
+            // macOS: AT_EMPTY_PATH not available; use fchown on the fd directly.
+            #[cfg(not(target_os = "macos"))]
             syscall!(unsafe {
                 libc::fchownat(
                     inode_data.as_raw_descriptor(),
@@ -3006,6 +3014,10 @@ impl FileSystem for PassthroughFs {
                     gid,
                     AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
                 )
+            })?;
+            #[cfg(target_os = "macos")]
+            syscall!(unsafe {
+                libc::fchown(inode_data.as_raw_descriptor(), uid, gid)
             })?;
         }
 

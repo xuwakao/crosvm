@@ -219,6 +219,7 @@ impl<F: FileSystem + Sync> Worker<F> {
             Kill,
         }
 
+        base::info!("virtiofs: worker starting");
         let wait_ctx = WaitContext::build_with(&[
             (self.queue.event(), Token::QueueReady),
             (&kill_evt, Token::Kill),
