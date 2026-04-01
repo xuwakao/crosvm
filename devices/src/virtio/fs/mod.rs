@@ -164,8 +164,10 @@ impl Fs {
         // There is always a high priority queue in addition to the request queues.
         let num_queues = num_workers + 1;
 
-        // TODO(b/176129399): Remove cfg! once DAX is supported on ARM.
-        let use_dax = cfg!(target_arch = "x86_64") && fs.cfg().use_dax;
+        // DAX on ARM64/HVF: implemented via mmap + hv_vm_map (host-side mmap
+        // of file → map into guest address space). Original upstream TODO was
+        // because KVM ARM64 hadn't been tested, not a fundamental limitation.
+        let use_dax = fs.cfg().use_dax;
 
         Ok(Fs {
             cfg,

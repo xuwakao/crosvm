@@ -34,12 +34,23 @@ use crate::Vm;
 use crate::VmCap;
 
 /// Apple Hypervisor.framework VM instance.
+/// Tracks a DAX file mapping in guest address space.
+struct DaxMapping {
+    host_addr: *mut libc::c_void,
+    guest_addr: u64,
+    size: usize,
+}
+// SAFETY: DaxMapping contains a raw pointer to mmap'd memory that is only
+// accessed within the VM's memory management methods (add_fd_mapping/remove_mapping).
+unsafe impl Send for DaxMapping {}
+
 pub struct HvfVm {
     hvf: Hvf,
     guest_mem: GuestMemory,
     mem_regions: Arc<Mutex<BTreeMap<MemSlot, (GuestAddress, Box<dyn MappedRegion>)>>>,
     next_mem_slot: Arc<Mutex<MemSlot>>,
     ioevents: Arc<Mutex<FnvHashMap<IoEventAddress, Event>>>,
+    dax_mappings: Arc<Mutex<BTreeMap<(u32, usize), DaxMapping>>>,
 }
 
 impl HvfVm {
@@ -195,6 +206,7 @@ impl HvfVm {
             mem_regions: Arc::new(Mutex::new(BTreeMap::new())),
             next_mem_slot: Arc::new(Mutex::new(0)),
             ioevents: Arc::new(Mutex::new(FnvHashMap::default())),
+            dax_mappings: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 }
@@ -207,6 +219,7 @@ impl Vm for HvfVm {
             mem_regions: self.mem_regions.clone(),
             next_mem_slot: self.next_mem_slot.clone(),
             ioevents: self.ioevents.clone(),
+            dax_mappings: self.dax_mappings.clone(),
         })
     }
 
@@ -352,18 +365,79 @@ impl Vm for HvfVm {
 
     fn add_fd_mapping(
         &mut self,
-        _slot: u32,
-        _offset: usize,
-        _size: usize,
-        _fd: &dyn base::AsRawDescriptor,
-        _fd_offset: u64,
-        _prot: Protection,
+        slot: u32,
+        offset: usize,
+        size: usize,
+        fd: &dyn base::AsRawDescriptor,
+        fd_offset: u64,
+        prot: Protection,
     ) -> Result<()> {
-        Err(base::Error::new(libc::ENOTSUP))
+        // HVF doesn't have KVM's KVM_SET_USER_MEMORY_REGION with fd support.
+        // Workaround: mmap the file on the host, then map the mmap'd memory
+        // into guest address space via hv_vm_map. This achieves DAX semantics:
+        // guest load/store instructions directly access file contents.
+
+        let mut mmap_prot = libc::PROT_READ;
+        if prot.allows(&Protection::write()) {
+            mmap_prot |= libc::PROT_WRITE;
+        }
+
+        // mmap the file region on the host.
+        let host_addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                mmap_prot,
+                libc::MAP_SHARED,
+                fd.as_raw_descriptor(),
+                fd_offset as libc::off_t,
+            )
+        };
+        if host_addr == libc::MAP_FAILED {
+            return Err(base::Error::new(unsafe { *libc::__error() }));
+        }
+
+        // Find the guest physical address for this slot+offset.
+        let mem_regions = self.mem_regions.lock();
+        let (guest_base, _) = mem_regions
+            .get(&slot)
+            .ok_or(base::Error::new(libc::EINVAL))?;
+        let guest_addr = guest_base.0 + offset as u64;
+        drop(mem_regions);
+
+        // Map into guest address space.
+        let mut hvf_flags = ffi::HV_MEMORY_READ;
+        if prot.allows(&Protection::write()) {
+            hvf_flags |= ffi::HV_MEMORY_WRITE;
+        }
+
+        let ret = unsafe { ffi::hv_vm_map(host_addr as *const _, guest_addr, size, hvf_flags) };
+        if ret != ffi::HV_SUCCESS {
+            unsafe { libc::munmap(host_addr, size) };
+            return Err(base::Error::new(libc::EIO));
+        }
+
+        // Track the mapping for cleanup.
+        self.dax_mappings.lock().insert(
+            (slot, offset),
+            DaxMapping { host_addr, guest_addr, size },
+        );
+
+        Ok(())
     }
 
-    fn remove_mapping(&mut self, _slot: u32, _offset: usize, _size: usize) -> Result<()> {
-        Err(base::Error::new(libc::ENOTSUP))
+    fn remove_mapping(&mut self, slot: u32, offset: usize, size: usize) -> Result<()> {
+        let key = (slot, offset);
+        if let Some(mapping) = self.dax_mappings.lock().remove(&key) {
+            // Unmap from guest.
+            let ret = unsafe { ffi::hv_vm_unmap(mapping.guest_addr, mapping.size) };
+            if ret != ffi::HV_SUCCESS {
+                base::warn!("hv_vm_unmap failed for DAX mapping at {:#x}", mapping.guest_addr);
+            }
+            // Unmap from host.
+            unsafe { libc::munmap(mapping.host_addr, mapping.size) };
+        }
+        Ok(())
     }
 
     fn handle_balloon_event(&mut self, _event: BalloonEvent) -> Result<()> {
