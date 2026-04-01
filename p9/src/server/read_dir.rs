@@ -49,8 +49,8 @@ impl ReadDir {
         #[cfg(target_os = "macos")]
         let d_off = unsafe { libc::telldir(self.dir) } as u64;
 
-        // Use strlen to get the actual name length instead of transmuting the
-        // full fixed-size d_name array (avoids panic if no null terminator).
+        // Get name length via strlen. Safe because libc::readdir()/readdir64()
+        // guarantees d_name is null-terminated per POSIX.
         let d_name: &[u8] = unsafe {
             let ptr = (*dirent).d_name.as_ptr() as *const u8;
             let len = libc::strlen(ptr as *const libc::c_char);
@@ -82,6 +82,9 @@ pub fn read_dir<D: AsRawFd>(dir: &mut D, offset: libc::c_long) -> Result<ReadDir
 
     let read_dir = ReadDir { dir };
 
+    // seekdir with offset from a previous telldir(). On macOS, telldir() returns
+    // an opaque cookie that may become invalid if the directory is modified between
+    // calls. This is an inherent POSIX limitation, not a bug in our code.
     unsafe { libc::seekdir(read_dir.dir, offset) };
 
     Ok(read_dir)

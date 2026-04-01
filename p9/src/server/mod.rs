@@ -468,9 +468,14 @@ fn open_fid(proc: &File, path: &File, p9_flags: u32) -> io::Result<File> {
         if ret < 0 {
             return Err(io::Error::last_os_error());
         }
+        // Guarantee null termination for CStr::from_ptr safety.
+        pathbuf[libc::PATH_MAX as usize - 1] = 0;
         let pathname = unsafe { CStr::from_ptr(pathbuf.as_ptr() as *const _) };
+        // Keep O_NOFOLLOW to prevent symlink following (TOCTOU mitigation).
+        // Unlike Linux /proc/self/fd/N which resolves through the kernel,
+        // F_GETPATH returns a pathname that could race with renames/symlinks.
         syscall!(unsafe {
-            libc::open(pathname.as_ptr(), flags & !libc::O_NOFOLLOW)
+            libc::open(pathname.as_ptr(), flags)
         })?
     };
 

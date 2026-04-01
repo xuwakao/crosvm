@@ -77,20 +77,9 @@ struct Worker {
 impl Worker {
     fn process_queue(&mut self) -> P9Result<()> {
         while let Some(mut avail_desc) = self.queue.pop() {
-            let read_bytes = avail_desc.reader.available_bytes();
-            let write_bytes = avail_desc.writer.available_bytes();
-            match self.server
+            self.server
                 .handle_message(&mut avail_desc.reader, &mut avail_desc.writer)
-            {
-                Ok(()) => {
-                    base::info!("p9: handled message, read={} write_avail={} written={}",
-                        read_bytes, write_bytes, avail_desc.writer.bytes_written());
-                }
-                Err(e) => {
-                    base::error!("p9: handle_message error: {}", e);
-                    return Err(P9Error::Internal(e));
-                }
-            }
+                .map_err(P9Error::Internal)?;
 
             self.queue.add_used(avail_desc);
         }
@@ -192,7 +181,6 @@ impl VirtioDevice for P9 {
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
-        base::info!("p9: read_config offset={} len={} config_len={}", offset, data.len(), self.config.len());
         copy_config(data, 0, self.config.as_slice(), offset);
     }
 
