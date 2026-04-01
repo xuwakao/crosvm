@@ -111,7 +111,14 @@ extern "C" fn fsevents_callback(
     _event_flags: *const u32,
     _event_ids: *const u64,
 ) {
+    // SAFETY: `info` points to a heap-allocated CallbackInfo kept alive by
+    // FsEventsMonitor._info. FSEventStreamCreate copies the info pointer value
+    // from the context struct (not the struct itself), so the stack-allocated
+    // FSEventStreamContext going out of scope after creation is safe.
     let info = unsafe { &*(info as *const CallbackInfo) };
+    // Stack buffer for path + newline. Single write ≤ PIPE_BUF (512 on macOS)
+    // is atomic and avoids interleaved partial paths from concurrent callbacks.
+    let mut buf = [0u8; 512];
     for i in 0..num_events {
         let path_ptr = unsafe { *event_paths.add(i) };
         if path_ptr.is_null() {
@@ -119,11 +126,18 @@ extern "C" fn fsevents_callback(
         }
         let path = unsafe { CStr::from_ptr(path_ptr) };
         let bytes = path.to_bytes();
-        // Write path + newline atomically (if < PIPE_BUF).
-        // Non-blocking: silently drops events if pipe is full.
+        let total = bytes.len() + 1; // +1 for newline
+        if total > buf.len() {
+            // Path too long for atomic write — skip this event.
+            // The file will be revalidated via normal timeout instead.
+            continue;
+        }
+        buf[..bytes.len()].copy_from_slice(bytes);
+        buf[bytes.len()] = b'\n';
+        // Single atomic write (total ≤ PIPE_BUF). Non-blocking: silently
+        // drops the event if the pipe is full (returns EAGAIN).
         unsafe {
-            libc::write(info.pipe_fd, bytes.as_ptr() as *const c_void, bytes.len());
-            libc::write(info.pipe_fd, b"\n".as_ptr() as *const c_void, 1);
+            libc::write(info.pipe_fd, buf.as_ptr() as *const c_void, total);
         }
     }
 }
@@ -217,6 +231,11 @@ impl FsEventsMonitor {
         }
 
         // Stream context with pointer to our CallbackInfo.
+        // FSEventStreamCreate copies the `info` pointer value from this struct
+        // during the call (Apple docs: "A copy is made of the info pointer, but
+        // not the context structure itself"). So `stream_ctx` on the stack is safe
+        // — it only needs to live through the FSEventStreamCreate call.
+        // The CallbackInfo itself lives in `_info: Box<CallbackInfo>`.
         let stream_ctx = FSEventStreamContext {
             version: 0,
             info: &*info as *const CallbackInfo as *mut c_void,

@@ -180,16 +180,22 @@ impl Fs {
         // The monitor watches the shared directory and marks changed inodes as stale
         // in the PassthroughFs's stale set. GETATTR/LOOKUP then returns timeout=0
         // for those inodes, forcing the guest kernel to revalidate.
+        // Guard: only start if root_dir was set to a real shared directory
+        // (not the default "/", which would monitor the entire filesystem).
         #[cfg(target_os = "macos")]
         let _fsevents_monitor = {
-            let stale = fs.stale_inodes();
             let root = fs.root_dir();
-            match fsevents::FsEventsMonitor::start(&root, stale) {
-                Ok(monitor) => Some(monitor),
-                Err(e) => {
-                    warn!("FSEvents monitor failed to start: {}", e);
-                    None
+            if root != "/" {
+                let stale = fs.stale_inodes();
+                match fsevents::FsEventsMonitor::start(&root, stale) {
+                    Ok(monitor) => Some(monitor),
+                    Err(e) => {
+                        warn!("FSEvents monitor failed to start: {}", e);
+                        None
+                    }
                 }
+            } else {
+                None
             }
         };
 
