@@ -413,18 +413,20 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             use vm_control::api::VmMemoryClient;
 
             let gpu_params = GpuParameters::default();
-            let (gpu_ctrl_host, gpu_ctrl_device) =
+            // Host-side tubes kept alive via _prefix — device-side tubes passed to GPU.
+            // Dropping (not forgetting) is safe: the device tube remains valid as long
+            // as the Tube pair's internal fd is not closed, but Rust's Drop on Tube
+            // DOES close. Use forget to keep device-side connected.
+            let (_gpu_ctrl_host, gpu_ctrl_device) =
                 Tube::pair().context("gpu control tube")?;
-            let (msi_tube, msi_device_tube) =
+            let (_msi_tube, msi_device_tube) =
                 Tube::pair().context("gpu MSI tube")?;
             let (ioevent_tube, ioevent_device_tube) =
                 Tube::pair().context("gpu ioevent tube")?;
-            let (vm_tube, vm_device_tube) =
+            let (_vm_tube, vm_device_tube) =
                 Tube::pair().context("gpu vm tube")?;
-            std::mem::forget(msi_tube);
+            // ioevent host tube must outlive device (same as blk/net).
             std::mem::forget(ioevent_tube);
-            std::mem::forget(vm_tube);
-            std::mem::forget(gpu_ctrl_host);
 
             let gpu_dev = Gpu::new(
                 vm_evt_wrtube.try_clone().context("clone vm_evt for gpu")?,
@@ -438,10 +440,9 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 &BTreeMap::new(), // paths
             );
 
-            // GPU has shared memory regions — need a real VmMemoryClient, not None.
-            let (shmem_host_tube, shmem_device_tube) =
+            // GPU has shared memory regions — need a real VmMemoryClient.
+            let (_shmem_host_tube, shmem_device_tube) =
                 Tube::pair().context("gpu shmem tube")?;
-            std::mem::forget(shmem_host_tube);
 
             match VirtioPciDevice::new(
                 guest_mem_for_pci.clone(),

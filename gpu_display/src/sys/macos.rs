@@ -16,7 +16,7 @@ use crate::DisplayEventToken;
 
 pub(crate) trait MacosDisplayT: DisplayT {}
 
-// DisplayStub implements MacosDisplayT via gpu_display_stub.rs (line 123: impl SysDisplayT for DisplayStub)
+// DisplayStub implements MacosDisplayT via `impl SysDisplayT for DisplayStub` in gpu_display_stub.rs
 
 pub trait MacosGpuDisplayExt {
     fn open_stub() -> GpuDisplayResult<GpuDisplay>;
