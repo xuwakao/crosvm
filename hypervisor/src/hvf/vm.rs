@@ -51,6 +51,9 @@ pub struct HvfVm {
     next_mem_slot: Arc<Mutex<MemSlot>>,
     ioevents: Arc<Mutex<FnvHashMap<IoEventAddress, Event>>>,
     dax_mappings: Arc<Mutex<BTreeMap<(u32, usize), DaxMapping>>>,
+    // Slots where hv_vm_map was actually called (not skipped for DAX windows).
+    // Used by remove_memory_region to avoid unmapping regions that were never mapped.
+    mapped_slots: Arc<Mutex<std::collections::HashSet<MemSlot>>>,
 }
 
 impl HvfVm {
@@ -207,6 +210,7 @@ impl HvfVm {
             next_mem_slot: Arc::new(Mutex::new(0)),
             ioevents: Arc::new(Mutex::new(FnvHashMap::default())),
             dax_mappings: Arc::new(Mutex::new(BTreeMap::new())),
+            mapped_slots: Arc::new(Mutex::new(std::collections::HashSet::new())),
         })
     }
 }
@@ -220,6 +224,7 @@ impl Vm for HvfVm {
             next_mem_slot: self.next_mem_slot.clone(),
             ioevents: self.ioevents.clone(),
             dax_mappings: self.dax_mappings.clone(),
+            mapped_slots: self.mapped_slots.clone(),
         })
     }
 
@@ -304,6 +309,10 @@ impl Vm for HvfVm {
         let slot = *slot_lock;
         *slot_lock += 1;
 
+        if !skip_mapping {
+            self.mapped_slots.lock().insert(slot);
+        }
+
         self.mem_regions
             .lock()
             .insert(slot, (guest_addr, mem_region));
@@ -342,8 +351,14 @@ impl Vm for HvfVm {
             .remove(&slot)
             .ok_or_else(|| base::Error::new(libc::EINVAL))?;
 
-        let ret = unsafe { ffi::hv_vm_unmap(guest_addr.0, mem_region.size()) };
-        hvf_result(ret)?;
+        // Only unmap regions that were actually mapped via hv_vm_map.
+        // DAX windows (CacheNonCoherent) skip the initial mapping and are
+        // mapped on-demand by add_fd_mapping; the sub-region cleanup above
+        // already handled those.
+        if self.mapped_slots.lock().remove(&slot) {
+            let ret = unsafe { ffi::hv_vm_unmap(guest_addr.0, mem_region.size()) };
+            hvf_result(ret)?;
+        }
 
         Ok(mem_region)
     }
