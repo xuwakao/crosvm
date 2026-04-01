@@ -317,6 +317,25 @@ impl Vm for HvfVm {
     }
 
     fn remove_memory_region(&mut self, slot: MemSlot) -> Result<Box<dyn MappedRegion>> {
+        // Clean up any DAX file mappings within this memory region first.
+        // Without this, mmap'd file pages for active DAX mappings would leak.
+        {
+            let mut dax_map = self.dax_mappings.lock();
+            let keys: Vec<_> = dax_map
+                .keys()
+                .filter(|(s, _)| *s == slot)
+                .copied()
+                .collect();
+            for key in keys {
+                if let Some(mapping) = dax_map.remove(&key) {
+                    unsafe {
+                        ffi::hv_vm_unmap(mapping.guest_addr, mapping.size);
+                        libc::munmap(mapping.host_addr, mapping.size);
+                    }
+                }
+            }
+        }
+
         let (guest_addr, mem_region) = self
             .mem_regions
             .lock()
@@ -454,11 +473,15 @@ impl Vm for HvfVm {
             return Err(base::Error::new(errno));
         }
 
-        // Track the mapping for cleanup.
-        self.dax_mappings.lock().insert(
-            (slot, offset),
+        // Track the mapping for cleanup. If remapping the same (slot, offset),
+        // munmap the previous host mapping to prevent memory leaks.
+        let key = (slot, offset);
+        if let Some(old) = self.dax_mappings.lock().insert(
+            key,
             DaxMapping { host_addr, guest_addr, size },
-        );
+        ) {
+            unsafe { libc::munmap(old.host_addr, old.size) };
+        }
 
         Ok(())
     }
