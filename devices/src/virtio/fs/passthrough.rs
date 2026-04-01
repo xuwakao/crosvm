@@ -7,6 +7,7 @@ use std::cell::RefCell;
 use std::cmp;
 use std::collections::btree_map;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::ffi::CStr;
 use std::ffi::CString;
 #[cfg(feature = "fs_runtime_ugid_map")]
@@ -370,10 +371,10 @@ ioctl_iowr_nr!(FS_IOC_MEASURE_VERITY, 'f' as u32, 134, fsverity_digest);
 pub type Inode = u64;
 type Handle = u64;
 
-#[derive(Clone, Copy, Debug, PartialOrd, Ord, PartialEq, Eq)]
-struct InodeAltKey {
-    ino: ino64_t,
-    dev: libc::dev_t,
+#[derive(Clone, Copy, Debug, Hash, PartialOrd, Ord, PartialEq, Eq)]
+pub(crate) struct InodeAltKey {
+    pub ino: ino64_t,
+    pub dev: libc::dev_t,
 }
 
 #[derive(PartialEq, Eq, Debug)]
@@ -984,6 +985,13 @@ pub struct PassthroughFs {
     // capability for mount namespaces and pivot_root. This lack of isolation means that
     // root_dir defaults to the path provided via "--shared-dir".
     root_dir: String,
+
+    // Inodes whose backing files were recently modified on the host.
+    // FSEvents monitor populates this set; GETATTR/LOOKUP check it
+    // and return timeout=0 for stale inodes, forcing guest revalidation.
+    // The FsEventsMonitor itself lives in the Fs device (not here)
+    // to avoid Sync issues with raw pointers in the monitor.
+    stale_inodes: Arc<sync::Mutex<HashSet<InodeAltKey>>>,
 }
 
 impl std::fmt::Debug for PassthroughFs {
@@ -1064,6 +1072,7 @@ impl PassthroughFs {
             xattr_paths: RwLock::new(Vec::new()),
             cfg,
             root_dir: "/".to_string(),
+            stale_inodes: Arc::new(sync::Mutex::new(HashSet::new())),
         };
 
         #[cfg(feature = "fs_runtime_ugid_map")]
@@ -1101,6 +1110,16 @@ impl PassthroughFs {
         };
         self.root_dir = canonicalized_root.to_string_lossy().to_string();
         Ok(())
+    }
+
+    /// Returns a clone of the stale inodes set for sharing with FSEvents monitor.
+    pub fn stale_inodes(&self) -> Arc<sync::Mutex<HashSet<InodeAltKey>>> {
+        self.stale_inodes.clone()
+    }
+
+    /// Returns the root directory path being served.
+    pub fn root_dir(&self) -> String {
+        self.root_dir.clone()
     }
 
     pub fn cfg(&self) -> &Config {
@@ -1270,13 +1289,19 @@ impl PassthroughFs {
             inode
         };
 
+        // Check stale set for adaptive timeout (FSEvents integration).
+        let timeout = if self.stale_inodes.lock().remove(&altkey) {
+            Duration::ZERO
+        } else {
+            self.cfg.timeout
+        };
+
         Entry {
             inode,
             generation: 0,
             attr: st,
-            // We use the same timeout for the attribute and the entry.
-            attr_timeout: self.cfg.timeout,
-            entry_timeout: self.cfg.timeout,
+            attr_timeout: timeout,
+            entry_timeout: timeout,
         }
     }
 
@@ -1340,13 +1365,18 @@ impl PassthroughFs {
             self.set_permission(&mut st, &path);
             #[cfg(feature = "fs_runtime_ugid_map")]
             self.set_ugid_permission(&mut st, &path);
+            // Check stale set for adaptive timeout (FSEvents integration).
+            let timeout = if self.stale_inodes.lock().remove(&altkey) {
+                Duration::ZERO
+            } else {
+                self.cfg.timeout
+            };
             return Ok(Entry {
                 inode: self.increase_inode_refcount(data),
                 generation: 0,
                 attr: st,
-                // We use the same timeout for the attribute and the entry.
-                attr_timeout: self.cfg.timeout,
-                entry_timeout: self.cfg.timeout,
+                attr_timeout: timeout,
+                entry_timeout: timeout,
             });
         }
 
@@ -1512,7 +1542,20 @@ impl PassthroughFs {
         self.set_permission(&mut st, &inode.path);
         #[cfg(feature = "fs_runtime_ugid_map")]
         self.set_ugid_permission(&mut st, &inode.path);
-        Ok((st, self.cfg.timeout))
+
+        // Check if this inode was recently modified on the host (FSEvents).
+        // If stale, return timeout=0 to force guest revalidation on next access.
+        let key = InodeAltKey {
+            ino: st.st_ino as _,
+            dev: st.st_dev as _,
+        };
+        let timeout = if self.stale_inodes.lock().remove(&key) {
+            Duration::ZERO
+        } else {
+            self.cfg.timeout
+        };
+
+        Ok((st, timeout))
     }
 
     fn do_unlink(&self, parent: &InodeData, name: &CStr, flags: libc::c_int) -> io::Result<()> {

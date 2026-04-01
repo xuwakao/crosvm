@@ -362,8 +362,13 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
 
             let tag = "host_share";
             let mut fs_cfg = FsConfig::default();
-            // cache=always for best performance on macOS.
-            fs_cfg.cache_policy = CachePolicy::Always;
+            // cache=auto with 30s timeout: good cache hit rate for unchanged files,
+            // combined with FSEvents-driven adaptive timeouts for recently-changed files
+            // (timeout=0 → immediate revalidation on next access).
+            // cache=always is unsuitable for shared dirs: no revalidation path exists
+            // because virtiofs FUSE_NOTIFY is not supported by the Linux kernel driver.
+            fs_cfg.cache_policy = CachePolicy::Auto;
+            fs_cfg.timeout = std::time::Duration::from_secs(30);
             // DAX: guest mmap → hv_vm_map → direct host file access (zero-copy).
             fs_cfg.use_dax = true;
 

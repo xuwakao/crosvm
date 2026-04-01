@@ -45,6 +45,8 @@ mod arc_ioctl;
 mod caps;
 mod config;
 mod expiring_map;
+#[cfg(target_os = "macos")]
+pub(crate) mod fsevents;
 mod multikey;
 pub mod passthrough;
 mod read_dir;
@@ -126,6 +128,11 @@ pub struct Fs {
     pci_bar: Option<Alloc>,
     tube: Option<Tube>,
     workers: Vec<WorkerThread<()>>,
+    // FSEvents monitor for adaptive cache invalidation on macOS.
+    // Lives in Fs (not PassthroughFs) to avoid Sync issues with raw pointers.
+    // Dropped when the Fs device is dropped → stops monitoring.
+    #[cfg(target_os = "macos")]
+    _fsevents_monitor: Option<fsevents::FsEventsMonitor>,
 }
 
 impl Fs {
@@ -169,6 +176,23 @@ impl Fs {
         // because KVM ARM64 hadn't been tested, not a fundamental limitation.
         let use_dax = fs.cfg().use_dax;
 
+        // Start FSEvents monitor for adaptive cache invalidation on macOS.
+        // The monitor watches the shared directory and marks changed inodes as stale
+        // in the PassthroughFs's stale set. GETATTR/LOOKUP then returns timeout=0
+        // for those inodes, forcing the guest kernel to revalidate.
+        #[cfg(target_os = "macos")]
+        let _fsevents_monitor = {
+            let stale = fs.stale_inodes();
+            let root = fs.root_dir();
+            match fsevents::FsEventsMonitor::start(&root, stale) {
+                Ok(monitor) => Some(monitor),
+                Err(e) => {
+                    warn!("FSEvents monitor failed to start: {}", e);
+                    None
+                }
+            }
+        };
+
         Ok(Fs {
             cfg,
             tag: tag.to_string(),
@@ -180,6 +204,8 @@ impl Fs {
             pci_bar: None,
             tube: Some(tube),
             workers: Vec::with_capacity(num_workers + 1),
+            #[cfg(target_os = "macos")]
+            _fsevents_monitor,
         })
     }
 }
