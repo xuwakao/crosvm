@@ -110,7 +110,7 @@ use snapshot::SnapshotReader;
 use snapshot::SnapshotWriter;
 use swap::SwapStatus;
 use sync::Mutex;
-#[cfg(any(target_os = "android", target_os = "linux"))]
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
 pub use sys::FsMappingRequest;
 #[cfg(windows)]
 pub use sys::InitialAudioSessionState;

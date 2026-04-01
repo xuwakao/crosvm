@@ -110,12 +110,8 @@ mod compat {
     pub use libc::off_t as off64_t;
     pub use libc::statvfs as statvfs64;
 
-    pub unsafe fn openat64(
-        dirfd: libc::c_int, pathname: *const libc::c_char,
-        flags: libc::c_int,
-    ) -> libc::c_int {
-        libc::openat(dirfd, pathname, flags)
-    }
+    // openat64 → openat. libc::openat is variadic (mode optional).
+    pub use libc::openat as openat64;
 
     pub unsafe fn fstatat64(
         dirfd: libc::c_int, pathname: *const libc::c_char,
@@ -162,6 +158,51 @@ mod compat {
     pub unsafe fn fdatasync(fd: libc::c_int) -> libc::c_int {
         libc::fcntl(fd, libc::F_FULLFSYNC)
     }
+
+    // macOS xattr API has extra `position` and `options` parameters.
+    // Wrap to match Linux's simpler 4/5-arg signatures.
+    pub unsafe fn getxattr(
+        path: *const libc::c_char, name: *const libc::c_char,
+        value: *mut libc::c_void, size: libc::size_t,
+    ) -> libc::ssize_t {
+        libc::getxattr(path, name, value, size, 0, 0)
+    }
+    pub unsafe fn fgetxattr(
+        fd: libc::c_int, name: *const libc::c_char,
+        value: *mut libc::c_void, size: libc::size_t,
+    ) -> libc::ssize_t {
+        libc::fgetxattr(fd, name, value, size, 0, 0)
+    }
+    pub unsafe fn setxattr(
+        path: *const libc::c_char, name: *const libc::c_char,
+        value: *const libc::c_void, size: libc::size_t, flags: libc::c_int,
+    ) -> libc::c_int {
+        libc::setxattr(path, name, value, size, 0, flags)
+    }
+    pub unsafe fn fsetxattr(
+        fd: libc::c_int, name: *const libc::c_char,
+        value: *const libc::c_void, size: libc::size_t, flags: libc::c_int,
+    ) -> libc::c_int {
+        libc::fsetxattr(fd, name, value, size, 0, flags)
+    }
+    pub unsafe fn listxattr(
+        path: *const libc::c_char, list: *mut libc::c_char, size: libc::size_t,
+    ) -> libc::ssize_t {
+        libc::listxattr(path, list, size, 0)
+    }
+    pub unsafe fn flistxattr(
+        fd: libc::c_int, list: *mut libc::c_char, size: libc::size_t,
+    ) -> libc::ssize_t {
+        libc::flistxattr(fd, list, size, 0)
+    }
+    pub unsafe fn removexattr(
+        path: *const libc::c_char, name: *const libc::c_char,
+    ) -> libc::c_int {
+        libc::removexattr(path, name, 0)
+    }
+    pub unsafe fn fremovexattr(fd: libc::c_int, name: *const libc::c_char) -> libc::c_int {
+        libc::fremovexattr(fd, name, 0)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -174,6 +215,8 @@ use libc::{
     O_PATH, O_DIRECT, O_TMPFILE, O_DIRECTORY, AT_EMPTY_PATH,
     prctl,
     SYS_copy_file_range,
+    getxattr, fgetxattr, setxattr, fsetxattr,
+    listxattr, flistxattr, removexattr, fremovexattr,
 };
 
 const EMPTY_CSTR: &CStr = c"";
@@ -500,19 +543,40 @@ macro_rules! scoped_cred {
         }
     };
 }
+#[cfg(not(target_os = "macos"))]
 scoped_cred!(ScopedUid, libc::uid_t, SYS_setresuid);
+#[cfg(not(target_os = "macos"))]
 scoped_cred!(ScopedGid, libc::gid_t, SYS_setresgid);
 
+// macOS: No per-thread credential switching. Stub types that always return None (no change).
+#[cfg(target_os = "macos")]
+struct ScopedUid;
+#[cfg(target_os = "macos")]
+impl ScopedUid {
+    fn new(_val: libc::uid_t, _old: libc::uid_t) -> io::Result<Option<Self>> { Ok(None) }
+}
+#[cfg(target_os = "macos")]
+struct ScopedGid;
+#[cfg(target_os = "macos")]
+impl ScopedGid {
+    fn new(_val: libc::gid_t, _old: libc::gid_t) -> io::Result<Option<Self>> { Ok(None) }
+}
+
+#[cfg(not(target_os = "macos"))]
 const SYS_GETEUID: libc::c_long = SYS_geteuid;
+#[cfg(not(target_os = "macos"))]
 const SYS_GETEGID: libc::c_long = SYS_getegid;
 
 thread_local! {
-    // SAFETY: both calls take no parameters and only return an integer value. The kernel also
-    // guarantees that they can never fail.
+    #[cfg(not(target_os = "macos"))]
     static THREAD_EUID: libc::uid_t = unsafe { libc::syscall(SYS_GETEUID) as libc::uid_t };
-    // SAFETY: both calls take no parameters and only return an integer value. The kernel also
-    // guarantees that they can never fail.
+    #[cfg(not(target_os = "macos"))]
     static THREAD_EGID: libc::gid_t = unsafe { libc::syscall(SYS_GETEGID) as libc::gid_t };
+    // macOS: use libc::geteuid/getegid (process-wide, not per-thread).
+    #[cfg(target_os = "macos")]
+    static THREAD_EUID: libc::uid_t = unsafe { libc::geteuid() };
+    #[cfg(target_os = "macos")]
+    static THREAD_EGID: libc::gid_t = unsafe { libc::getegid() };
 }
 
 fn set_creds(
@@ -1482,7 +1546,7 @@ impl PassthroughFs {
 
             // SAFETY: this will only modify `value` and we check the return value.
             self.with_proc_chdir(|| unsafe {
-                libc::getxattr(
+                getxattr(
                     path.as_ptr(),
                     name.as_ptr(),
                     value.as_mut_ptr() as *mut libc::c_void,
@@ -1493,7 +1557,7 @@ impl PassthroughFs {
             // For regular files and directories, we can just use fgetxattr.
             // SAFETY: this will only write to `value` and we check the return value.
             unsafe {
-                libc::fgetxattr(
+                fgetxattr(
                     file.as_raw_descriptor(),
                     name.as_ptr(),
                     value.as_mut_ptr() as *mut libc::c_void,
@@ -2526,10 +2590,10 @@ impl FileSystem for PassthroughFs {
         let (_uid, _gid) = set_creds(uid, gid)?;
         {
             let casefold_cache = self.lock_casefold_lookup_caches();
-            let _scoped_umask = ScopedUmask::new(umask);
+            let _scoped_umask = ScopedUmask::new(umask as libc::mode_t);
 
             // SAFETY: this doesn't modify any memory and we check the return value.
-            syscall!(unsafe { libc::mkdirat(data.as_raw_descriptor(), name.as_ptr(), mode) })?;
+            syscall!(unsafe { libc::mkdirat(data.as_raw_descriptor(), name.as_ptr(), mode as libc::mode_t) })?;
             if let Some(mut c) = casefold_cache {
                 c.insert(data.inode, name);
             }
@@ -2645,7 +2709,7 @@ impl FileSystem for PassthroughFs {
         let (_uid, _gid) = set_creds(uid, gid)?;
 
         let fd = {
-            let _scoped_umask = ScopedUmask::new(umask);
+            let _scoped_umask = ScopedUmask::new(umask as libc::mode_t);
 
             // SAFETY: this doesn't modify any memory and we check the return value.
             syscall!(unsafe {
@@ -2712,7 +2776,7 @@ impl FileSystem for PassthroughFs {
             (flags | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW) & !O_DIRECT;
 
         let fd = {
-            let _scoped_umask = ScopedUmask::new(umask);
+            let _scoped_umask = ScopedUmask::new(umask as libc::mode_t);
             let casefold_cache = self.lock_casefold_lookup_caches();
 
             // SAFETY: this doesn't modify any memory and we check the return value. We don't really
@@ -2913,7 +2977,7 @@ impl FileSystem for PassthroughFs {
                 match data {
                     Data::Handle(ref fd) => libc::fchmod(fd.as_raw_descriptor(), attr.st_mode),
                     Data::ProcPath(ref p) => {
-                        libc::fchmodat(self.proc.as_raw_descriptor(), p.as_ptr(), attr.st_mode, 0)
+                        libc::fchmodat(self.proc.as_raw_descriptor(), p.as_ptr(), attr.st_mode as libc::mode_t, 0)
                     }
                 }
             })?;
@@ -3018,7 +3082,8 @@ impl FileSystem for PassthroughFs {
 
             // SAFETY: this doesn't modify any memory and we check the return value.
             // TODO: Switch to libc::renameat2 once https://github.com/rust-lang/libc/pull/1508 lands
-            // and we have glibc 2.28.
+            // renameat2: Linux-only. macOS: fallback to renameat (loses RENAME_NOREPLACE atomicity).
+            #[cfg(not(target_os = "macos"))]
             syscall!(unsafe {
                 libc::syscall(
                     SYS_renameat2,
@@ -3027,6 +3092,15 @@ impl FileSystem for PassthroughFs {
                     new_inode.as_raw_descriptor(),
                     newname.as_ptr(),
                     flags,
+                )
+            })?;
+            #[cfg(target_os = "macos")]
+            syscall!(unsafe {
+                libc::renameat(
+                    old_inode.as_raw_descriptor(),
+                    oldname.as_ptr(),
+                    new_inode.as_raw_descriptor(),
+                    newname.as_ptr(),
                 )
             })?;
             if let Some(mut c) = casefold_cache {
@@ -3075,7 +3149,7 @@ impl FileSystem for PassthroughFs {
 
         let (_uid, _gid) = set_creds(uid, gid)?;
         {
-            let _scoped_umask = ScopedUmask::new(umask);
+            let _scoped_umask = ScopedUmask::new(umask as libc::mode_t);
             let casefold_cache = self.lock_casefold_lookup_caches();
 
             // SAFETY: this doesn't modify any memory and we check the return value.
@@ -3350,7 +3424,7 @@ impl FileSystem for PassthroughFs {
             syscall!(self.with_proc_chdir(|| {
                 // SAFETY: this doesn't modify any memory and we check the return value.
                 unsafe {
-                    libc::setxattr(
+                    setxattr(
                         path.as_ptr(),
                         name.as_ptr(),
                         value.as_ptr() as *const libc::c_void,
@@ -3364,7 +3438,7 @@ impl FileSystem for PassthroughFs {
                 // For regular files and directories, we can just use fsetxattr.
                 // SAFETY: this doesn't modify any memory and we check the return value.
                 unsafe {
-                    libc::fsetxattr(
+                    fsetxattr(
                         file.as_raw_descriptor(),
                         name.as_ptr(),
                         value.as_ptr() as *const libc::c_void,
@@ -3427,7 +3501,7 @@ impl FileSystem for PassthroughFs {
 
             // SAFETY: this will only modify `buf` and we check the return value.
             syscall!(self.with_proc_chdir(|| unsafe {
-                libc::listxattr(
+                listxattr(
                     path.as_ptr(),
                     buf.as_mut_ptr() as *mut libc::c_char,
                     buf.len() as libc::size_t,
@@ -3437,7 +3511,7 @@ impl FileSystem for PassthroughFs {
             // For regular files and directories, we can just flistxattr.
             // SAFETY: this will only write to `buf` and we check the return value.
             syscall!(unsafe {
-                libc::flistxattr(
+                flistxattr(
                     file.as_raw_descriptor(),
                     buf.as_mut_ptr() as *mut libc::c_char,
                     buf.len() as libc::size_t,
@@ -3479,12 +3553,12 @@ impl FileSystem for PassthroughFs {
 
             syscall!(self.with_proc_chdir(||
                     // SAFETY: this doesn't modify any memory and we check the return value.
-                    unsafe { libc::removexattr(path.as_ptr(), name.as_ptr()) }))?;
+                    unsafe { removexattr(path.as_ptr(), name.as_ptr()) }))?;
         } else {
             // For regular files and directories, we can just use fremovexattr.
             syscall!(
                 // SAFETY: this doesn't modify any memory and we check the return value.
-                unsafe { libc::fremovexattr(file.as_raw_descriptor(), name.as_ptr()) }
+                unsafe { fremovexattr(file.as_raw_descriptor(), name.as_ptr()) }
             )?;
         }
 
@@ -3665,21 +3739,37 @@ impl FileSystem for PassthroughFs {
         let src = src_data.as_raw_descriptor();
         let dst = dst_data.as_raw_descriptor();
 
-        Ok(syscall!(
-            // SAFETY: this call is safe because it doesn't modify any memory and we
-            // check the return value.
-            unsafe {
-                libc::syscall(
-                    SYS_copy_file_range,
-                    src,
-                    &offset_src,
-                    dst,
-                    &offset_dst,
-                    length,
-                    flags,
-                )
+        // copy_file_range: Linux-only. macOS: fallback to sendfile or manual copy.
+        #[cfg(not(target_os = "macos"))]
+        let copied = syscall!(unsafe {
+            libc::syscall(
+                SYS_copy_file_range,
+                src,
+                &offset_src,
+                dst,
+                &offset_dst,
+                length,
+                flags,
+            )
+        })? as usize;
+
+        #[cfg(target_os = "macos")]
+        let copied = {
+            // macOS: no copy_file_range. Use pread + pwrite as fallback.
+            let mut buf = vec![0u8; std::cmp::min(length as usize, 1024 * 1024)];
+            let n = syscall!(unsafe {
+                libc::pread(src, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), offset_src as i64)
+            })? as usize;
+            if n > 0 {
+                syscall!(unsafe {
+                    libc::pwrite(dst, buf.as_ptr() as *const libc::c_void, n, offset_dst as i64)
+                })? as usize
+            } else {
+                0
             }
-        )? as usize)
+        };
+
+        Ok(copied)
     }
 
     fn set_up_mapping<M: Mapper>(

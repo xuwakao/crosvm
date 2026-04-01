@@ -18,6 +18,7 @@ type cap_flag_t = u32;
 #[allow(non_camel_case_types)]
 type cap_flag_value_t = i32;
 
+#[cfg(not(target_os = "macos"))]
 #[link(name = "cap")]
 extern "C" {
     fn cap_free(ptr: *mut c_void) -> c_int;
@@ -108,8 +109,21 @@ impl From<Value> for cap_flag_value_t {
     }
 }
 
+// macOS: no libcap. Provide a stub Caps that always succeeds (no-op).
+#[cfg(target_os = "macos")]
+pub struct Caps;
+
+#[cfg(target_os = "macos")]
+impl Caps {
+    pub fn for_current_thread() -> io::Result<Caps> { Ok(Caps) }
+    pub fn update(&mut self, _caps: &[Capability], _set: Set, _value: Value) -> io::Result<()> { Ok(()) }
+    pub fn apply(&self) -> io::Result<()> { Ok(()) }
+}
+
+#[cfg(not(target_os = "macos"))]
 pub struct Caps(cap_t);
 
+#[cfg(not(target_os = "macos"))]
 impl Caps {
     /// Get the capabilities for the current thread.
     pub fn for_current_thread() -> io::Result<Caps> {
@@ -157,6 +171,7 @@ impl Caps {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 impl Drop for Caps {
     fn drop(&mut self) {
         // SAFETY: cap_t is allocated from `Self`
