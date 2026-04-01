@@ -3894,10 +3894,18 @@ impl FileSystem for PassthroughFs {
 
         let read = prot & libc::PROT_READ as u32 != 0;
         let write = prot & libc::PROT_WRITE as u32 != 0;
+        // On macOS/HVF, hv_vm_map requires the underlying mmap fd to be opened
+        // with O_RDWR — even for read-only guest mappings. Without this, hv_vm_map
+        // returns HV_BAD_PARAMETER. Always use O_RDWR for DAX fd open.
+        #[cfg(target_os = "macos")]
+        let (mmap_flags, prot) = match (read, write) {
+            (true, _) | (_, true) => (libc::O_RDWR, if write { Protection::read_write() } else { Protection::read() }),
+            (false, false) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+        };
+        #[cfg(not(target_os = "macos"))]
         let (mmap_flags, prot) = match (read, write) {
             (true, true) => (libc::O_RDWR, Protection::read_write()),
             (true, false) => (libc::O_RDONLY, Protection::read()),
-            // Write-only is mapped to O_RDWR since mmap always requires an fd opened for reading.
             (false, true) => (libc::O_RDWR, Protection::write()),
             (false, false) => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
         };

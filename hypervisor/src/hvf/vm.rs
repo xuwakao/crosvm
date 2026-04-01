@@ -396,50 +396,30 @@ impl Vm for HvfVm {
             mmap_prot |= libc::PROT_WRITE;
         }
 
-        // Allocate anonymous memory and populate it from the file.
+        // MAP_SHARED file mapping → hv_vm_map: true zero-copy DAX.
         //
-        // HVF's hv_vm_map rejects file-backed MAP_SHARED mappings
-        // (returns HV_BAD_PARAMETER). Workaround: allocate anonymous pages,
-        // populate via pread, then hv_vm_map. This sacrifices true zero-copy
-        // DAX but gives the guest a fast-path without per-read FUSE round-trips.
+        // Guest load/store instructions directly access the host file's page
+        // cache. Writes propagate to the file immediately (MAP_SHARED semantics).
         //
-        // Limitation: writable mappings use COW pages. Guest writes do NOT
-        // propagate back to the host file. Writeback caching is disabled on
-        // macOS to prevent silent data loss. Reads are always fresh at mapping
-        // time (pread from file), but the snapshot is immutable once mapped.
+        // HVF requirements (undocumented, empirically determined):
+        // 1. The fd must be opened with O_RDWR (not O_RDONLY), even for
+        //    read-only guest mappings. Handled in passthrough.rs set_up_mapping.
+        // 2. The mmap must use PROT_READ|PROT_WRITE for the same reason.
+        // 3. The DAX window must NOT be pre-mapped (hv_vm_map rejects mapping
+        //    over existing mappings). prepare_shared_memory_region uses
+        //    CacheNonCoherent to skip pre-mapping on HVF.
         let host_addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 size,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
+                libc::MAP_SHARED,
+                fd.as_raw_descriptor(),
+                fd_offset as libc::off_t,
             )
         };
         if host_addr == libc::MAP_FAILED {
             return Err(base::Error::new(unsafe { *libc::__error() }));
-        }
-
-        // Populate from file. Read as much as available (file may be smaller
-        // than the mapping window). Remainder stays zeroed.
-        let nread = unsafe {
-            libc::pread(
-                fd.as_raw_descriptor(),
-                host_addr,
-                size,
-                fd_offset as libc::off_t,
-            )
-        };
-        if nread < 0 {
-            let err = unsafe { *libc::__error() };
-            unsafe { libc::munmap(host_addr, size) };
-            return Err(base::Error::new(err));
-        }
-
-        // Make the mapping read-only if requested (after populating).
-        if !prot.allows(&Protection::write()) {
-            unsafe { libc::mprotect(host_addr, size, libc::PROT_READ) };
         }
 
         // Find the guest physical address for this slot+offset.
