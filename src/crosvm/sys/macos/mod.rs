@@ -378,11 +378,12 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 Ok(fs_dev) => {
                     let (_msi_tube, msi_device_tube) =
                         Tube::pair().context("fs MSI tube")?;
-                    let (ioevent_tube, ioevent_device_tube) =
+                    let (ioevent_host_tube_fs, ioevent_device_tube) =
                         Tube::pair().context("fs ioevent tube")?;
                     let (_vm_tube, vm_device_tube) =
                         Tube::pair().context("fs vm tube")?;
-                    std::mem::forget(ioevent_tube);
+                    // Keep ioevent host tube alive for the register_ioevent path.
+                    ioevent_host_tubes.push(ioevent_host_tube_fs);
 
                     match VirtioPciDevice::new(
                         guest_mem_for_pci.clone(),

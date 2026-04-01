@@ -2401,15 +2401,18 @@ impl FileSystem for PassthroughFs {
     type DirIter = ReadDir<Box<[u8]>>;
 
     fn init(&self, capable: FsOptions) -> io::Result<FsOptions> {
+        base::info!("virtiofs passthrough: init() called, root_dir='{}', capable={:#x}", self.root_dir, capable.bits());
         let root = CString::new(self.root_dir.clone())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
         let flags = O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        // SAFETY: this doesn't modify any memory and we check the return value.
         let raw_descriptor = unsafe { openat64(libc::AT_FDCWD, root.as_ptr(), flags) };
         if raw_descriptor < 0 {
-            return Err(io::Error::last_os_error());
+            let e = io::Error::last_os_error();
+            base::error!("virtiofs passthrough: init() openat64 failed for '{}': {}", self.root_dir, e);
+            return Err(e);
         }
+        base::info!("virtiofs passthrough: init() root opened successfully, fd={}", raw_descriptor);
 
         // SAFETY: safe because we just opened this descriptor above.
         let f = unsafe { File::from_raw_descriptor(raw_descriptor) };

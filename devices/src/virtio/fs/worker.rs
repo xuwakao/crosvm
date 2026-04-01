@@ -152,11 +152,18 @@ fn process_fs_queue<F: FileSystem + Sync>(
 ) -> Result<()> {
     let mapper = Mapper::new(Arc::clone(tube), slot);
     while let Some(mut avail_desc) = queue.pop() {
-        let total =
-            server.handle_message(&mut avail_desc.reader, &mut avail_desc.writer, &mapper)?;
-
-        queue.add_used_with_bytes_written(avail_desc, total as u32);
-        queue.trigger_interrupt();
+        let read_bytes = avail_desc.reader.available_bytes();
+        match server.handle_message(&mut avail_desc.reader, &mut avail_desc.writer, &mapper) {
+            Ok(total) => {
+                base::info!("virtiofs: processed FUSE msg, read={}, response={}", read_bytes, total);
+                queue.add_used_with_bytes_written(avail_desc, total as u32);
+                queue.trigger_interrupt();
+            }
+            Err(e) => {
+                base::error!("virtiofs: FUSE msg error: {:?}", e);
+                return Err(e);
+            }
+        }
     }
 
     Ok(())
@@ -225,12 +232,14 @@ impl<F: FileSystem + Sync> Worker<F> {
             (&kill_evt, Token::Kill),
         ])
         .map_err(Error::CreateWaitContext)?;
+        base::info!("virtiofs: worker wait_ctx created, entering loop");
 
         loop {
             let events = wait_ctx.wait().map_err(Error::WaitError)?;
             for event in events.iter().filter(|e| e.is_readable) {
                 match event.token {
                     Token::QueueReady => {
+                        base::info!("virtiofs: QueueReady event received!");
                         self.queue.event().wait().map_err(Error::ReadQueueEvent)?;
                         if let Err(e) =
                             process_fs_queue(&mut self.queue, &self.server, &self.tube, self.slot)
