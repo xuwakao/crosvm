@@ -363,9 +363,8 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             let mut fs_cfg = FsConfig::default();
             // cache=always for best performance on macOS.
             fs_cfg.cache_policy = CachePolicy::Always;
-            // DAX: crosvm-side implementation ready (add_fd_mapping via mmap+hv_vm_map).
-            // Disabled until kernel has CONFIG_FUSE_DAX (needs ZONE_DEVICE chain).
-            // fs_cfg.use_dax = true;
+            // DAX: guest mmap → hv_vm_map → direct host file access (zero-copy).
+            fs_cfg.use_dax = true;
 
             let (fs_tube_host, fs_tube_device) =
                 Tube::pair().context("virtiofs tube")?;
@@ -388,12 +387,16 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                     // Keep ioevent host tube alive for the register_ioevent path.
                     ioevent_host_tubes.push(ioevent_host_tube_fs);
 
+                    // DAX: shared memory client for mapping file regions into guest.
+                    let (_shmem_host, shmem_device) =
+                        Tube::pair().context("fs shmem tube")?;
+
                     match VirtioPciDevice::new(
                         guest_mem_for_pci.clone(),
                         Box::new(fs_dev),
                         msi_device_tube,
                         false,
-                        None, // DAX disabled — no shared memory region needed
+                        Some(VmMemoryClient::new(shmem_device)),
                         VmMemoryClient::new_noop_ioevent(ioevent_device_tube),
                         vm_device_tube,
                     ) {
