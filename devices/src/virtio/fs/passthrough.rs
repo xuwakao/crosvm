@@ -160,11 +160,6 @@ mod compat {
     }
 
     // macOS errno translation: ENOATTR (93 on macOS) → ENODATA (61 on Linux).
-    // Without this, the guest sees errno 93 as ENOPROTOOPT ("Protocol not supported")
-    // which breaks virtiofs mount because GETXATTR for security.* attrs fails fatally.
-    const MACOS_ENOATTR: libc::c_int = 93;
-    const LINUX_ENODATA: libc::c_int = 61;
-
     /// /proc/self/fd/N path relative to PROC_CSTR root.
     /// Linux: "self/fd/{fd}" (relative to /proc)
     /// macOS: "fd/{fd}" (relative to /dev)
@@ -172,30 +167,20 @@ mod compat {
         format!("fd/{fd}")
     }
 
-    fn translate_xattr_errno() {
-        unsafe {
-            if *libc::__error() == MACOS_ENOATTR {
-                *libc::__error() = LINUX_ENODATA;
-            }
-        }
-    }
-
     // macOS xattr API has extra `position` and `options` parameters.
+    // Errno translation (ENOATTR→ENODATA etc.) is handled globally in
+    // fuse::server::translate_errno_to_linux at the FUSE response boundary.
     pub unsafe fn getxattr(
         path: *const libc::c_char, name: *const libc::c_char,
         value: *mut libc::c_void, size: libc::size_t,
     ) -> libc::ssize_t {
-        let r = libc::getxattr(path, name, value, size, 0, 0);
-        if r < 0 { translate_xattr_errno(); }
-        r
+        libc::getxattr(path, name, value, size, 0, 0)
     }
     pub unsafe fn fgetxattr(
         fd: libc::c_int, name: *const libc::c_char,
         value: *mut libc::c_void, size: libc::size_t,
     ) -> libc::ssize_t {
-        let r = libc::fgetxattr(fd, name, value, size, 0, 0);
-        if r < 0 { translate_xattr_errno(); }
-        r
+        libc::fgetxattr(fd, name, value, size, 0, 0)
     }
     pub unsafe fn setxattr(
         path: *const libc::c_char, name: *const libc::c_char,
@@ -212,16 +197,12 @@ mod compat {
     pub unsafe fn listxattr(
         path: *const libc::c_char, list: *mut libc::c_char, size: libc::size_t,
     ) -> libc::ssize_t {
-        let r = libc::listxattr(path, list, size, 0);
-        if r < 0 { translate_xattr_errno(); }
-        r
+        libc::listxattr(path, list, size, 0)
     }
     pub unsafe fn flistxattr(
         fd: libc::c_int, list: *mut libc::c_char, size: libc::size_t,
     ) -> libc::ssize_t {
-        let r = libc::flistxattr(fd, list, size, 0);
-        if r < 0 { translate_xattr_errno(); }
-        r
+        libc::flistxattr(fd, list, size, 0)
     }
     pub unsafe fn removexattr(
         path: *const libc::c_char, name: *const libc::c_char,

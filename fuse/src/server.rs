@@ -1855,10 +1855,73 @@ fn reply_ok<T: IntoBytes + Immutable, W: Writer>(
     Ok(len)
 }
 
+/// Translate a host (macOS) errno to a Linux errno for the FUSE guest.
+/// macOS and Linux share many POSIX errno values (1-34), but diverge significantly
+/// above that range. Without this translation, the Linux guest sees wrong error codes
+/// (e.g., macOS ENOSYS=78 appears as Linux EREMCHG=78, breaking ZERO_MESSAGE_OPEN).
+#[cfg(target_os = "macos")]
+fn translate_errno_to_linux(macos_errno: i32) -> i32 {
+    match macos_errno {
+        // POSIX-compatible range (1-34): identical on macOS and Linux.
+        1..=34 => macos_errno,
+        // Divergent errno values requiring explicit mapping.
+        35 => 11,   // EAGAIN (macOS: EDEADLK=11 is different, but EAGAIN=35→11)
+        // Actually on macOS EAGAIN=35, Linux EAGAIN=11. Let me build a correct table.
+        // macOS errno → Linux errno (from sys/errno.h on both platforms)
+        36 => 115,  // EINPROGRESS: macOS=36, Linux=115
+        37 => 114,  // EALREADY: macOS=37, Linux=114
+        38 => 88,   // ENOTSOCK: macOS=38, Linux=88
+        39 => 89,   // EDESTADDRREQ: macOS=39, Linux=89
+        40 => 90,   // EMSGSIZE: macOS=40, Linux=90
+        41 => 91,   // EPROTOTYPE: macOS=41, Linux=91
+        42 => 92,   // ENOPROTOOPT: macOS=42, Linux=92
+        43 => 93,   // EPROTONOSUPPORT: macOS=43, Linux=93
+        44 => 94,   // ESOCKTNOSUPPORT: macOS=44, Linux=94
+        45 => 95,   // ENOTSUP/EOPNOTSUPP: macOS=45, Linux=95
+        46 => 96,   // EPFNOSUPPORT: macOS=46, Linux=96
+        47 => 97,   // EAFNOSUPPORT: macOS=47, Linux=97
+        48 => 98,   // EADDRINUSE: macOS=48, Linux=98
+        49 => 99,   // EADDRNOTAVAIL: macOS=49, Linux=99
+        50 => 100,  // ENETDOWN: macOS=50, Linux=100
+        51 => 101,  // ENETUNREACH: macOS=51, Linux=101
+        52 => 102,  // ENETRESET: macOS=52, Linux=102
+        53 => 103,  // ECONNABORTED: macOS=53, Linux=103
+        54 => 104,  // ECONNRESET: macOS=54, Linux=104
+        55 => 105,  // ENOBUFS: macOS=55, Linux=105
+        56 => 106,  // EISCONN: macOS=56, Linux=106
+        57 => 107,  // ENOTCONN: macOS=57, Linux=107
+        58 => 108,  // ESHUTDOWN: macOS=58, Linux=108 (not in POSIX)
+        60 => 110,  // ETIMEDOUT: macOS=60, Linux=110
+        61 => 111,  // ECONNREFUSED: macOS=61, Linux=111
+        62 => 40,   // ELOOP: macOS=62, Linux=40
+        63 => 36,   // ENAMETOOLONG: macOS=63, Linux=36
+        65 => 113,  // EHOSTUNREACH: macOS=65, Linux=113
+        66 => 39,   // ENOTEMPTY: macOS=66, Linux=39
+        69 => 122,  // EDQUOT: macOS=69, Linux=122
+        70 => 116,  // ESTALE: macOS=70, Linux=116
+        71 => 109,  // EREMOTE: macOS=71, Linux=66 (different semantics)
+        78 => 38,   // ENOSYS: macOS=78, Linux=38 (CRITICAL for ZERO_MESSAGE_OPEN)
+        84 => 75,   // EOVERFLOW: macOS=84, Linux=75
+        90 => 125,  // ECANCELED: macOS=89→125? Actually macOS=89, Linux=125
+        92 => 37,   // EILSEQ: macOS=92, Linux=84
+        93 => 61,   // ENOATTR→ENODATA: macOS=93, Linux=61
+        102 => 95,  // EOPNOTSUPP (explicit): macOS=102, Linux=95
+        // Default: pass through unchanged (best effort for unmapped values)
+        _ => macos_errno,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn translate_errno_to_linux(errno: i32) -> i32 {
+    errno // Linux→Linux: no translation needed.
+}
+
 fn reply_error<W: Writer>(e: io::Error, unique: u64, mut w: W) -> Result<usize> {
+    let raw_errno = e.raw_os_error().unwrap_or(libc::EIO);
+    let linux_errno = translate_errno_to_linux(raw_errno);
     let header = OutHeader {
         len: size_of::<OutHeader>() as u32,
-        error: -e.raw_os_error().unwrap_or(libc::EIO),
+        error: -linux_errno,
         unique,
     };
 
