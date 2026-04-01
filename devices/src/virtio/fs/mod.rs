@@ -148,7 +148,18 @@ impl Fs {
             num_request_queues: Le32::from(num_workers as u32),
         };
 
-        let fs = PassthroughFs::new(tag, fs_cfg).map_err(Error::CreateFs)?;
+        let mut fs = PassthroughFs::new(tag, fs_cfg).map_err(Error::CreateFs)?;
+
+        // On macOS, there's no jail/chroot. Set root_dir explicitly.
+        // On Linux, the jail pivot_roots to the shared directory.
+        #[cfg(target_os = "macos")]
+        if let Ok(root) = std::env::var("AETHERIA_SHARE") {
+            fs.set_root_dir(root).map_err(Error::CreateFs)?;
+        } else if std::path::Path::new("/private/tmp/aetheria-share").is_dir() {
+            let p = std::fs::canonicalize("/private/tmp/aetheria-share")
+                .unwrap_or_else(|_| "/private/tmp/aetheria-share".into());
+            fs.set_root_dir(p.to_string_lossy().to_string()).map_err(Error::CreateFs)?;
+        }
 
         // There is always a high priority queue in addition to the request queues.
         let num_queues = num_workers + 1;

@@ -1068,7 +1068,7 @@ impl PassthroughFs {
         }
     }
 
-    #[cfg(feature = "fs_runtime_ugid_map")]
+    #[cfg(any(feature = "fs_runtime_ugid_map", target_os = "macos"))]
     pub fn set_root_dir(&mut self, shared_dir: String) -> io::Result<()> {
         let canonicalized_root = match std::fs::canonicalize(shared_dir) {
             Ok(path) => path,

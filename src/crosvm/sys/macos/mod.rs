@@ -347,42 +347,46 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             }
         }
 
-        // 9P filesystem sharing: share host directory with guest VM.
-        // Guest mounts via: mount -t 9p -o trans=virtio,version=9p2000.L host_share /mnt
-        // WARNING: The 9P server runs without sandboxing on macOS. The guest can
-        // access any file within the shared directory tree. Do not share sensitive
-        // directories (/, /etc, /Users) without understanding the security implications.
+        // Filesystem sharing: virtiofs (primary) or 9P (fallback).
+        // Guest mounts: mount -t virtiofs host_share /mnt
         let share_path = std::env::var("AETHERIA_SHARE")
             .unwrap_or_else(|_| "/private/tmp/aetheria-share".to_string());
-        // Resolve symlinks (macOS /tmp → /private/tmp) so p9 server can open the dir.
         let share_path = std::fs::canonicalize(&share_path)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or(share_path);
         if std::path::Path::new(&share_path).is_dir() {
             use devices::virtio;
-            use devices::virtio::P9;
+            use devices::virtio::fs::{Fs, Config as FsConfig, CachePolicy};
             use vm_control::api::VmMemoryClient;
 
             let tag = "host_share";
-            let p9_cfg = ::p9::Config {
-                root: std::path::PathBuf::from(&share_path).into_boxed_path(),
-                ..Default::default()
-            };
-            match P9::new(virtio::base_features(ProtectionType::Unprotected), tag, p9_cfg) {
-                Ok(p9_dev) => {
-                    let (msi_tube, msi_device_tube) =
-                        Tube::pair().context("9p MSI tube")?;
+            let mut fs_cfg = FsConfig::default();
+            // cache=always for best performance on macOS.
+            fs_cfg.cache_policy = CachePolicy::Always;
+
+            let (fs_tube_host, fs_tube_device) =
+                Tube::pair().context("virtiofs tube")?;
+            std::mem::forget(fs_tube_host);
+
+            match Fs::new(
+                virtio::base_features(ProtectionType::Unprotected),
+                tag,
+                1, // num_workers
+                fs_cfg,
+                fs_tube_device,
+            ) {
+                Ok(fs_dev) => {
+                    let (_msi_tube, msi_device_tube) =
+                        Tube::pair().context("fs MSI tube")?;
                     let (ioevent_tube, ioevent_device_tube) =
-                        Tube::pair().context("9p ioevent tube")?;
-                    let (vm_tube, vm_device_tube) =
-                        Tube::pair().context("9p vm tube")?;
-                    std::mem::forget(msi_tube);
+                        Tube::pair().context("fs ioevent tube")?;
+                    let (_vm_tube, vm_device_tube) =
+                        Tube::pair().context("fs vm tube")?;
                     std::mem::forget(ioevent_tube);
-                    std::mem::forget(vm_tube);
 
                     match VirtioPciDevice::new(
                         guest_mem_for_pci.clone(),
-                        Box::new(p9_dev),
+                        Box::new(fs_dev),
                         msi_device_tube,
                         false,
                         None,
@@ -391,15 +395,15 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                     ) {
                         Ok(pci_dev) => {
                             devices.push((Box::new(pci_dev) as Box<dyn BusDeviceObj>, None));
-                            info!("virtio-9p device created, sharing '{}' as '{}'", share_path, tag);
+                            info!("virtiofs device created, sharing '{}' as '{}'", share_path, tag);
                         }
                         Err(e) => {
-                            info!("virtio-9p PCI wrap failed: {:#}", e);
+                            info!("virtiofs PCI wrap failed: {:#}", e);
                         }
                     }
                 }
                 Err(e) => {
-                    info!("virtio-9p creation failed: {}", e);
+                    info!("virtiofs creation failed: {:?}", e);
                 }
             }
         }
