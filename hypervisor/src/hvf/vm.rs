@@ -386,16 +386,6 @@ impl Vm for HvfVm {
         fd_offset: u64,
         prot: Protection,
     ) -> Result<()> {
-        // HVF doesn't have KVM's KVM_SET_USER_MEMORY_REGION with fd support.
-        // Workaround: mmap the file on the host, then map the mmap'd memory
-        // into guest address space via hv_vm_map. This achieves DAX semantics:
-        // guest load/store instructions directly access file contents.
-
-        let mut mmap_prot = libc::PROT_READ;
-        if prot.allows(&Protection::write()) {
-            mmap_prot |= libc::PROT_WRITE;
-        }
-
         // MAP_SHARED file mapping → hv_vm_map: true zero-copy DAX.
         //
         // Guest load/store instructions directly access the host file's page
@@ -442,13 +432,10 @@ impl Vm for HvfVm {
             hvf_flags |= ffi::HV_MEMORY_WRITE;
         }
 
-        // HVF requires unmapping the existing region before remapping.
-        // prepare_shared_memory_region() pre-maps a large anonymous arena
-        // at the DAX window's guest address. We must unmap the specific
-        // sub-range before mapping file-backed memory over it.
-        // If this sub-region was previously mapped (e.g., remapping a different
-        // file), unmap it first. Ignore errors (unmapping a never-mapped region
-        // returns HV_BAD_PARAMETER, which is expected on first use).
+        // Unmap any previous DAX mapping at this guest address (e.g., when
+        // remapping a different file into the same DAX window slot).
+        // First-use unmaps return HV_BAD_PARAMETER (no prior mapping), which
+        // is expected and harmless.
         unsafe { ffi::hv_vm_unmap(guest_addr, size) };
 
         let ret = unsafe { ffi::hv_vm_map(host_addr as *const _, guest_addr, size, hvf_flags) };
@@ -458,7 +445,13 @@ impl Vm for HvfVm {
                 ret, host_addr, guest_addr, size, hvf_flags
             );
             unsafe { libc::munmap(host_addr, size) };
-            return Err(base::Error::new(libc::EIO));
+            let errno = match ret {
+                ffi::HV_BAD_ARGUMENT => libc::EINVAL,
+                ffi::HV_NO_RESOURCES => libc::ENOMEM,
+                ffi::HV_DENIED => libc::EACCES,
+                _ => libc::EIO,  // HV_ERROR, HV_BUSY, etc.
+            };
+            return Err(base::Error::new(errno));
         }
 
         // Track the mapping for cleanup.
@@ -473,13 +466,21 @@ impl Vm for HvfVm {
     fn remove_mapping(&mut self, slot: u32, offset: usize, size: usize) -> Result<()> {
         let key = (slot, offset);
         if let Some(mapping) = self.dax_mappings.lock().remove(&key) {
+            if mapping.size != size {
+                base::warn!(
+                    "DAX remove_mapping size mismatch: stored={:#x} requested={:#x}",
+                    mapping.size, size
+                );
+            }
             // Unmap from guest.
             let ret = unsafe { ffi::hv_vm_unmap(mapping.guest_addr, mapping.size) };
             if ret != ffi::HV_SUCCESS {
-                base::warn!("hv_vm_unmap failed for DAX mapping at {:#x}", mapping.guest_addr);
+                base::warn!("hv_vm_unmap failed: ret={:#x} guest={:#x}", ret, mapping.guest_addr);
             }
             // Unmap from host.
-            unsafe { libc::munmap(mapping.host_addr, mapping.size) };
+            if unsafe { libc::munmap(mapping.host_addr, mapping.size) } != 0 {
+                base::warn!("munmap failed for DAX host mapping at {:?}", mapping.host_addr);
+            }
         }
         Ok(())
     }

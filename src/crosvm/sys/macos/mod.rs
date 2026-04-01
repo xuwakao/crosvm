@@ -370,13 +370,11 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             fs_cfg.cache_policy = CachePolicy::Auto;
             fs_cfg.timeout = std::time::Duration::from_secs(30);
             fs_cfg.negative_timeout = std::time::Duration::from_secs(5);
-            // Writeback caching: allows the guest kernel to buffer and coalesce
-            // FUSE_WRITE requests before sending them to the host. This is safe
-            // because writeback only affects the regular FUSE write() path, NOT
-            // DAX/mmap writes (confirmed by QEMU virtiofsd docs and all commercial
-            // implementations). DAX mappings on HVF are read-only snapshots
-            // (anonymous mmap + pread), so DAX writes are COW and don't reach
-            // the file regardless of this setting.
+            // Writeback caching: guest kernel buffers and coalesces FUSE_WRITE
+            // requests before sending them to the host. This only affects the
+            // regular FUSE write() path — DAX writes go through MAP_SHARED and
+            // propagate to the host file immediately regardless of this setting
+            // (confirmed by QEMU virtiofsd docs and all commercial implementations).
             fs_cfg.writeback = true;
             // Don't rewrite security xattrs — no unprivileged namespace on macOS.
             fs_cfg.rewrite_security_xattrs = false;

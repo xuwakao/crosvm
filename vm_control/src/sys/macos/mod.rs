@@ -128,7 +128,7 @@ pub fn prepare_shared_memory_region(
     vm: &mut dyn Vm,
     allocator: &mut SystemAllocator,
     alloc: Alloc,
-    cache: MemCacheType,
+    _cache: MemCacheType,
 ) -> Result<VmMappedMemoryRegion, SysError> {
     if !matches!(alloc, Alloc::PciBar { .. }) {
         return Err(SysError::new(EINVAL));
