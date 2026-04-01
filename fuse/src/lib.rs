@@ -4,7 +4,7 @@
 
 //! FUSE (Filesystem in Userspace) server and filesystem mounting support.
 
-#![cfg(any(target_os = "android", target_os = "linux"))]
+#![cfg(any(target_os = "android", target_os = "linux", target_os = "macos"))]
 
 use std::ffi::FromBytesWithNulError;
 use std::fs::File;
@@ -15,6 +15,7 @@ use thiserror::Error as ThisError;
 
 pub mod filesystem;
 pub mod fuzzing;
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub mod mount;
 mod server;
 #[allow(dead_code)]
@@ -22,6 +23,7 @@ pub mod sys;
 pub mod worker;
 
 use filesystem::FileSystem;
+#[cfg(any(target_os = "android", target_os = "linux"))]
 pub use mount::mount;
 pub use server::Mapper;
 pub use server::Reader;

@@ -45,7 +45,7 @@ pub struct Entry {
     /// Inode attributes. Even if `attr_timeout` is zero, `attr` must be correct. For example, for
     /// `open()`, FUSE uses `attr.st_size` from `lookup()` to determine how many bytes to request.
     /// If this value is not correct, incorrect data will be returned.
-    pub attr: libc::stat64,
+    pub attr: crate::sys::stat64,
 
     /// How long the values in `attr` should be considered valid. If the attributes of the `Entry`
     /// are only modified by the FUSE client, then this should be set to a very large value.
@@ -84,7 +84,7 @@ impl Entry {
     ///
     /// A new negative entry with provided entry timeout and 0 attr timeout.
     pub fn new_negative(negative_timeout: Duration) -> Entry {
-        let attr = MaybeUninit::<libc::stat64>::zeroed();
+        let attr = MaybeUninit::<crate::sys::stat64>::zeroed();
         Entry {
             inode: 0, // Using 0 for negative entry
             entry_timeout: negative_timeout,
@@ -102,7 +102,7 @@ pub struct DirEntry<'a> {
     /// The inode number for this entry. This does NOT have to be the same as the `Inode` for this
     /// directory entry. However, it must be the same as the `attr.st_ino` field of the `Entry`
     /// that would be returned by a `lookup` request in the parent directory for `name`.
-    pub ino: libc::ino64_t,
+    pub ino: crate::sys::ino64_t,
 
     /// Any non-zero value that the kernel can use to identify the current point in the directory
     /// entry stream. It does not need to be the actual physical position. A value of `0` is
@@ -484,7 +484,7 @@ pub trait FileSystem {
         ctx: Context,
         inode: Self::Inode,
         handle: Option<Self::Handle>,
-    ) -> io::Result<(libc::stat64, Duration)> {
+    ) -> io::Result<(crate::sys::stat64, Duration)> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -509,10 +509,10 @@ pub trait FileSystem {
         &self,
         ctx: Context,
         inode: Self::Inode,
-        attr: libc::stat64,
+        attr: crate::sys::stat64,
         handle: Option<Self::Handle>,
         valid: SetattrValid,
-    ) -> io::Result<(libc::stat64, Duration)> {
+    ) -> io::Result<(crate::sys::stat64, Duration)> {
         Err(io::Error::from_raw_os_error(libc::ENOSYS))
     }
 
@@ -904,9 +904,9 @@ pub trait FileSystem {
     }
 
     /// Get information about the file system.
-    fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<libc::statvfs64> {
+    fn statfs(&self, ctx: Context, inode: Self::Inode) -> io::Result<crate::sys::statvfs64> {
         // SAFETY: zero-initializing a struct with only POD fields.
-        let mut st: libc::statvfs64 = unsafe { mem::zeroed() };
+        let mut st: crate::sys::statvfs64 = unsafe { mem::zeroed() };
 
         // This matches the behavior of libfuse as it returns these values if the
         // filesystem doesn't implement this method.

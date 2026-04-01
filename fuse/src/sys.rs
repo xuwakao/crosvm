@@ -4,6 +4,22 @@
 
 use std::mem;
 
+// macOS compatibility: 64-bit types are the default on macOS.
+#[cfg(target_os = "macos")]
+mod compat {
+    pub use libc::stat as stat64;
+    pub use libc::ino_t as ino64_t;
+    pub use libc::statvfs as statvfs64;
+    // RENAME_* flags: macOS uses renameatx_np with different constants.
+    pub const RENAME_NOREPLACE: u32 = 0; // Stub — handled at passthrough level.
+    pub const RENAME_EXCHANGE: u32 = 0;
+}
+#[cfg(target_os = "macos")]
+pub use compat::*;
+
+#[cfg(not(target_os = "macos"))]
+pub use libc::{ino64_t, stat64, statvfs64, RENAME_EXCHANGE, RENAME_NOREPLACE};
+
 use bitflags::bitflags;
 use enumn::N;
 use zerocopy::FromBytes;
@@ -523,8 +539,8 @@ pub struct Attr {
     pub padding: u32,
 }
 
-impl From<libc::stat64> for Attr {
-    fn from(st: libc::stat64) -> Attr {
+impl From<stat64> for Attr {
+    fn from(st: stat64) -> Attr {
         Attr {
             ino: st.st_ino,
             size: st.st_size as u64,
@@ -535,7 +551,7 @@ impl From<libc::stat64> for Attr {
             atimensec: st.st_atime_nsec as u32,
             mtimensec: st.st_mtime_nsec as u32,
             ctimensec: st.st_ctime_nsec as u32,
-            mode: st.st_mode,
+            mode: st.st_mode as u32,
             #[allow(clippy::unnecessary_cast)]
             nlink: st.st_nlink as u32,
             uid: st.st_uid,
@@ -562,15 +578,15 @@ pub struct Kstatfs {
     pub spare: [u32; 6],
 }
 
-impl From<libc::statvfs64> for Kstatfs {
+impl From<statvfs64> for Kstatfs {
     #[allow(clippy::unnecessary_cast)]
-    fn from(st: libc::statvfs64) -> Self {
+    fn from(st: statvfs64) -> Self {
         Kstatfs {
-            blocks: st.f_blocks,
-            bfree: st.f_bfree,
-            bavail: st.f_bavail,
-            files: st.f_files,
-            ffree: st.f_ffree,
+            blocks: st.f_blocks as u64,
+            bfree: st.f_bfree as u64,
+            bavail: st.f_bavail as u64,
+            files: st.f_files as u64,
+            ffree: st.f_ffree as u64,
             bsize: st.f_bsize as u32,
             namelen: st.f_namemax as u32,
             frsize: st.f_frsize as u32,
@@ -769,11 +785,11 @@ pub struct SetattrIn {
     pub unused5: u32,
 }
 
-impl From<SetattrIn> for libc::stat64 {
-    fn from(s: SetattrIn) -> libc::stat64 {
+impl From<SetattrIn> for stat64 {
+    fn from(s: SetattrIn) -> stat64 {
         // SAFETY: zero-initializing a struct with only POD fields.
-        let mut out: libc::stat64 = unsafe { mem::zeroed() };
-        out.st_mode = s.mode;
+        let mut out: stat64 = unsafe { mem::zeroed() };
+        out.st_mode = s.mode as libc::mode_t;
         out.st_uid = s.uid;
         out.st_gid = s.gid;
         out.st_size = s.size as i64;

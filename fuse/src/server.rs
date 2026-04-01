@@ -303,7 +303,7 @@ impl<F: FileSystem + Sync> Server<F> {
 
         let valid = SetattrValid::from_bits_truncate(setattr_in.valid);
 
-        let st: libc::stat64 = setattr_in.into();
+        let st: crate::sys::stat64 = setattr_in.into();
 
         match self.fs.setattr(
             Context::from(in_header),
@@ -573,7 +573,7 @@ impl<F: FileSystem + Sync> Server<F> {
         let Rename2In { newdir, flags, .. } = r.read_struct()?;
 
         #[allow(clippy::unnecessary_cast)]
-        let flags = flags & (libc::RENAME_EXCHANGE | libc::RENAME_NOREPLACE) as u32;
+        let flags = flags & (crate::sys::RENAME_EXCHANGE | crate::sys::RENAME_NOREPLACE) as u32;
 
         self.do_rename(in_header, size_of::<Rename2In>(), newdir, flags, r, w)
     }
@@ -1145,9 +1145,9 @@ impl<F: FileSystem + Sync> Server<F> {
         let entry = if name == b"." || name == b".." {
             // Don't do lookups on the current directory or the parent directory.
             // SAFETY: struct only contains integer fields and any value is valid.
-            let mut attr = unsafe { MaybeUninit::<libc::stat64>::zeroed().assume_init() };
+            let mut attr = unsafe { MaybeUninit::<crate::sys::stat64>::zeroed().assume_init() };
             attr.st_ino = dir_entry.ino;
-            attr.st_mode = dir_entry.type_;
+            attr.st_mode = dir_entry.type_ as libc::mode_t;
 
             // We use 0 for the inode value to indicate a negative entry.
             Entry {
