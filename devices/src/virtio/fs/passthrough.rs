@@ -764,6 +764,21 @@ fn stat<F: AsRawDescriptor + ?Sized>(f: &F) -> io::Result<stat64> {
         libc::fstat(f.as_raw_descriptor(), st.as_mut_ptr())
     })?;
 
+    // SAFETY: the kernel guarantees that the struct is now fully initialized.
+    Ok(unsafe { st.assume_init() })
+}
+
+/// stat for symlink inodes on macOS. Uses lstat(path) instead of fstat(fd)
+/// because the fd is a /dev/null placeholder (no O_PATH on macOS).
+#[cfg(target_os = "macos")]
+fn stat_symlink(root_dir: &str, rel_path: &str) -> io::Result<stat64> {
+    let mut st: MaybeUninit<stat64> = MaybeUninit::<stat64>::zeroed();
+    let full_path = CString::new(format!("{}{}", root_dir, rel_path))
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path with null"))?;
+    syscall!(unsafe {
+        libc::lstat(full_path.as_ptr(), st.as_mut_ptr())
+    })?;
+
     Ok(unsafe { st.assume_init() })
 }
 
@@ -1569,6 +1584,15 @@ impl PassthroughFs {
     }
 
     fn do_getattr(&self, inode: &InodeData) -> io::Result<(stat64, Duration)> {
+        // macOS: symlink fd is /dev/null placeholder. Use lstat(path) instead.
+        #[cfg(target_os = "macos")]
+        #[allow(unused_mut)]
+        let mut st = if inode.filetype == FileType::Symlink {
+            stat_symlink(&self.root_dir, &inode.path)?
+        } else {
+            stat(inode)?
+        };
+        #[cfg(not(target_os = "macos"))]
         #[allow(unused_mut)]
         let mut st = stat(inode)?;
 
@@ -3138,7 +3162,7 @@ impl FileSystem for PassthroughFs {
             #[cfg(target_os = "macos")]
             {
                 if inode_data.filetype == FileType::Symlink {
-                    let full_path = format!("{}/{}", self.root_dir, inode_data.path);
+                    let full_path = format!("{}{}", self.root_dir, inode_data.path);
                     let c_path = CString::new(full_path).map_err(|_| {
                         io::Error::new(io::ErrorKind::InvalidInput, "path with null")
                     })?;
