@@ -422,15 +422,31 @@ impl Worker {
             conn.peer_buf_alloc = hdr.buf_alloc.to_native();
             conn.recv_cnt = conn.recv_cnt.wrapping_add(data.len() as u32);
 
-            if let Err(e) = conn.stream.write_all(data) {
-                error!("vsock: write to {} failed: {}", port_pair, e);
-                self.connections.remove(&port_pair);
-                self.send_response(
-                    hdr.src_port.to_native(),
-                    hdr.dst_port.to_native(),
-                    vsock_op::VIRTIO_VSOCK_OP_RST,
-                );
-                return;
+            // Write guest data to the host Unix socket. The socket is non-blocking,
+            // so write_all may fail with WouldBlock/EAGAIN if the buffer is full.
+            // This is NOT a fatal error — retry with backoff instead of killing
+            // the connection.
+            let mut written = 0;
+            while written < data.len() {
+                match conn.stream.write(&data[written..]) {
+                    Ok(n) => written += n,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Buffer full — brief sleep then retry.
+                        // This happens during heavy virtiofs I/O when the daemon
+                        // can't drain the socket fast enough.
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Err(e) => {
+                        error!("vsock: write to {} failed: {}", port_pair, e);
+                        self.connections.remove(&port_pair);
+                        self.send_response(
+                            hdr.src_port.to_native(),
+                            hdr.dst_port.to_native(),
+                            vsock_op::VIRTIO_VSOCK_OP_RST,
+                        );
+                        return;
+                    }
+                }
             }
 
             // Check if we need to send a credit update.
