@@ -1296,12 +1296,24 @@ impl PassthroughFs {
             self.cfg.timeout
         };
 
+        // Per-inode DAX: set FUSE_ATTR_DAX on regular files when use_dax is enabled.
+        // This allows dax=inode mount to use DAX for reads (zero-copy) while
+        // small writes go through FUSE_WRITE + writeback (coalesced).
+        let attr_flags = if self.cfg.use_dax
+            && FileType::from(st.st_mode as libc::mode_t) == FileType::Regular
+        {
+            fuse::sys::FUSE_ATTR_DAX
+        } else {
+            0
+        };
+
         Entry {
             inode,
             generation: 0,
             attr: st,
             attr_timeout: timeout,
             entry_timeout: timeout,
+            attr_flags,
         }
     }
 
@@ -1371,12 +1383,20 @@ impl PassthroughFs {
             } else {
                 self.cfg.timeout
             };
+            let attr_flags = if self.cfg.use_dax
+                && FileType::from(st.st_mode as libc::mode_t) == FileType::Regular
+            {
+                fuse::sys::FUSE_ATTR_DAX
+            } else {
+                0
+            };
             return Ok(Entry {
                 inode: self.increase_inode_refcount(data),
                 generation: 0,
                 attr: st,
                 attr_timeout: timeout,
                 entry_timeout: timeout,
+                attr_flags,
             });
         }
 

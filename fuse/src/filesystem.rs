@@ -55,10 +55,16 @@ pub struct Entry {
     /// entries are only changed or deleted by the FUSE client, then this should be set to a very
     /// large value.
     pub entry_timeout: Duration,
+
+    /// Attribute flags for this inode (e.g., FUSE_ATTR_DAX for per-inode DAX).
+    /// These flags are placed in Attr.flags in the FUSE protocol response.
+    pub attr_flags: u32,
 }
 
 impl From<Entry> for sys::EntryOut {
     fn from(entry: Entry) -> sys::EntryOut {
+        let mut attr: sys::Attr = entry.attr.into();
+        attr.flags |= entry.attr_flags;
         sys::EntryOut {
             nodeid: entry.inode,
             generation: entry.generation,
@@ -66,7 +72,7 @@ impl From<Entry> for sys::EntryOut {
             attr_valid: entry.attr_timeout.as_secs(),
             entry_valid_nsec: entry.entry_timeout.subsec_nanos(),
             attr_valid_nsec: entry.attr_timeout.subsec_nanos(),
-            attr: entry.attr.into(),
+            attr,
         }
     }
 }
@@ -93,6 +99,7 @@ impl Entry {
             generation: 0,
             // SAFETY: zero-initialized `stat64` is a valid value.
             attr: unsafe { attr.assume_init() },
+            attr_flags: 0,
         }
     }
 }

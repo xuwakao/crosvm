@@ -194,6 +194,10 @@ const INIT_EXT: u64 = 1073741824;
 /// requests.
 const SECURITY_CONTEXT: u64 = 4294967296;
 
+/// Server supports per-inode DAX. When set, the kernel uses FUSE_ATTR_DAX in
+/// Attr.flags to decide per-file whether to use DAX (dax=inode mount option).
+const HAS_INODE_DAX: u64 = 1 << 33;
+
 bitflags! {
     /// A bitfield passed in as a parameter to and returned from the `init` method of the
     /// `FileSystem` trait.
@@ -412,6 +416,10 @@ bitflags! {
 
         /// Indicates support for sending the security context with creation requests.
         const SECURITY_CONTEXT = SECURITY_CONTEXT;
+
+        /// Server supports per-inode DAX. With this flag, dax=inode mount option
+        /// uses FUSE_ATTR_DAX in Attr.flags to decide per-file DAX usage.
+        const HAS_INODE_DAX = HAS_INODE_DAX;
     }
 }
 
@@ -536,8 +544,14 @@ pub struct Attr {
     pub gid: u32,
     pub rdev: u32,
     pub blksize: u32,
-    pub padding: u32,
+    /// Attribute flags. Was `padding` in FUSE < 7.36.
+    /// FUSE_ATTR_DAX (0x2): file supports DAX (per-inode dax=inode mode).
+    pub flags: u32,
 }
+
+/// File attribute: this inode should use DAX for mmap/read access.
+/// Set in Attr.flags by the FUSE server for per-inode DAX (dax=inode mount).
+pub const FUSE_ATTR_DAX: u32 = 1 << 1;
 
 impl From<stat64> for Attr {
     fn from(st: stat64) -> Attr {

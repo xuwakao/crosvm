@@ -280,11 +280,17 @@ impl<F: FileSystem + Sync> Server<F> {
             .getattr(Context::from(in_header), in_header.nodeid.into(), handle)
         {
             Ok((st, timeout)) => {
+                let mut attr: Attr = st.into();
+                // Per-inode DAX: set FUSE_ATTR_DAX for regular files so the
+                // guest kernel uses DAX for reads (dax=inode mount option).
+                if (attr.mode & libc::S_IFMT as u32) == libc::S_IFREG as u32 {
+                    attr.flags |= FUSE_ATTR_DAX;
+                }
                 let out = AttrOut {
                     attr_valid: timeout.as_secs(),
                     attr_valid_nsec: timeout.subsec_nanos(),
                     dummy: 0,
-                    attr: st.into(),
+                    attr,
                 };
                 reply_ok(Some(out), None, in_header.unique, w)
             }
@@ -1009,6 +1015,7 @@ impl<F: FileSystem + Sync> Server<F> {
             | FsOptions::ATOMIC_O_TRUNC
             | FsOptions::MAX_PAGES
             | FsOptions::MAP_ALIGNMENT
+            | FsOptions::HAS_INODE_DAX
             | FsOptions::INIT_EXT;
 
         let capable = FsOptions::from_bits_truncate(u64::from(flags) | u64::from(flags2) << 32);
@@ -1156,6 +1163,7 @@ impl<F: FileSystem + Sync> Server<F> {
                 attr,
                 attr_timeout: Duration::from_secs(0),
                 entry_timeout: Duration::from_secs(0),
+                attr_flags: 0,
             }
         } else {
             self.fs
