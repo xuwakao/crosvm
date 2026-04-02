@@ -24,7 +24,11 @@ pub use crate::sys::RemoveMappingOne;
 pub use crate::sys::SetattrValid;
 pub use crate::sys::ROOT_ID;
 
-const MAX_BUFFER_SIZE: u32 = 1 << 20;
+// Maximum FUSE request size. Larger values reduce the number of FUSE
+// round-trips for sequential I/O (100MB write: 1MB→100 requests, 4MB→25).
+// The guest kernel allocates pages for each request, so this also affects
+// guest memory pressure. 4MB is a good balance for developer workloads.
+const MAX_BUFFER_SIZE: u32 = 4 << 20;
 
 /// Information about a path in the filesystem.
 #[derive(Debug)]

@@ -151,18 +151,24 @@ fn process_fs_queue<F: FileSystem + Sync>(
     slot: u32,
 ) -> Result<()> {
     let mapper = Mapper::new(Arc::clone(tube), slot);
+    let mut count = 0u32;
     while let Some(mut avail_desc) = queue.pop() {
-        let read_bytes = avail_desc.reader.available_bytes();
         match server.handle_message(&mut avail_desc.reader, &mut avail_desc.writer, &mapper) {
             Ok(total) => {
                 queue.add_used_with_bytes_written(avail_desc, total as u32);
-                queue.trigger_interrupt();
+                count += 1;
             }
             Err(e) => {
                 base::error!("virtiofs: FUSE msg error: {:?}", e);
                 return Err(e.into());
             }
         }
+    }
+    // Coalesce interrupts: signal the guest once after processing all
+    // available requests, not per-request. This reduces VM enter/exit
+    // overhead when the guest has queued multiple FUSE requests.
+    if count > 0 {
+        queue.trigger_interrupt();
     }
 
     Ok(())
