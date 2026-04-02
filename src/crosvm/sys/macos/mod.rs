@@ -387,10 +387,14 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 Tube::pair().context("virtiofs tube")?;
             fs_control_tube = Some(fs_tube_host);
 
+            // Use vCPU count as worker count for parallel FUSE request processing.
+            // Each worker runs on its own virtio request queue, allowing concurrent
+            // FUSE operations from multiple guest threads.
+            let fs_workers = components.vcpu_count.max(1);
             match Fs::new(
                 virtio::base_features(ProtectionType::Unprotected),
                 tag,
-                1, // num_workers
+                fs_workers,
                 fs_cfg,
                 fs_tube_device,
             ) {
