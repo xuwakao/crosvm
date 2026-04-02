@@ -1403,6 +1403,19 @@ impl PassthroughFs {
         // Open a regular file with O_RDONLY to store in `InodeData` so explicit open requests can
         // be skipped later if the ZERO_MESSAGE_{OPEN,OPENDIR} features are enabled.
         // If the crosvm process doesn't have a read permission, fall back to O_PATH below.
+        //
+        // Symlinks on macOS: O_PATH doesn't exist, and O_NOFOLLOW + O_RDONLY on a symlink
+        // returns ELOOP. Symlinks don't need an open fd — use /dev/null as placeholder.
+        #[cfg(target_os = "macos")]
+        if FileType::from(st.st_mode) == FileType::Other
+            && (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFLNK as u32
+        {
+            let devnull = std::fs::File::open("/dev/null").map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("open /dev/null: {e}"))
+            })?;
+            return Ok(self.add_entry(devnull, st, libc::O_RDONLY, path));
+        }
+
         let mut flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         match FileType::from(st.st_mode) {
             FileType::Regular => {}
