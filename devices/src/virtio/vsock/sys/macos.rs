@@ -16,6 +16,7 @@ use std::io::Read;
 use std::io::Write;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::io::RawFd;
+use std::os::raw::c_void;
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::collections::HashMap;
@@ -387,6 +388,19 @@ impl Worker {
         let socket_path = self.socket_dir.join(format!("port-{}", host_port));
         match UnixStream::connect(&socket_path) {
             Ok(stream) => {
+                // Increase socket buffer to handle bursts during heavy virtiofs I/O.
+                // Default macOS Unix socket buffer is ~8KB, which fills up when the
+                // daemon process can't drain fast enough under I/O pressure.
+                let buf_size: libc::c_int = 1024 * 1024; // 1MB
+                unsafe {
+                    libc::setsockopt(
+                        stream.as_raw_fd(),
+                        libc::SOL_SOCKET,
+                        libc::SO_SNDBUF,
+                        &buf_size as *const _ as *const libc::c_void,
+                        std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                    );
+                }
                 stream.set_nonblocking(true).ok();
                 let conn = VsockConnection {
                     stream,
@@ -423,18 +437,30 @@ impl Worker {
             conn.recv_cnt = conn.recv_cnt.wrapping_add(data.len() as u32);
 
             // Write guest data to the host Unix socket. The socket is non-blocking,
-            // so write_all may fail with WouldBlock/EAGAIN if the buffer is full.
-            // This is NOT a fatal error — retry with backoff instead of killing
-            // the connection.
+            // so we may get WouldBlock if the buffer is full (happens during heavy
+            // virtiofs I/O). Use poll() to wait for writability instead of busy-loop.
             let mut written = 0;
             while written < data.len() {
                 match conn.stream.write(&data[written..]) {
                     Ok(n) => written += n,
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // Buffer full — brief sleep then retry.
-                        // This happens during heavy virtiofs I/O when the daemon
-                        // can't drain the socket fast enough.
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        // Wait up to 5 seconds for the socket to become writable.
+                        let mut pfd = libc::pollfd {
+                            fd: conn.stream.as_raw_fd(),
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        };
+                        let ret = unsafe { libc::poll(&mut pfd, 1, 5000) };
+                        if ret <= 0 {
+                            error!("vsock: write to {} timed out waiting for buffer space", port_pair);
+                            self.connections.remove(&port_pair);
+                            self.send_response(
+                                hdr.src_port.to_native(),
+                                hdr.dst_port.to_native(),
+                                vsock_op::VIRTIO_VSOCK_OP_RST,
+                            );
+                            return;
+                        }
                     }
                     Err(e) => {
                         error!("vsock: write to {} failed: {}", port_pair, e);
