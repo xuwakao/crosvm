@@ -3416,6 +3416,32 @@ impl FileSystem for PassthroughFs {
 
         let mut buf = vec![0; libc::PATH_MAX as usize];
 
+        // macOS: symlink fd is /dev/null placeholder (no O_PATH).
+        // Use readlinkat with the full path instead of the fd.
+        #[cfg(target_os = "macos")]
+        let res = if data.filetype == FileType::Symlink {
+            let full_path = CString::new(format!("{}/{}", self.root_dir, data.path))
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path with null"))?;
+            syscall!(unsafe {
+                libc::readlinkat(
+                    libc::AT_FDCWD,
+                    full_path.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
+            })?
+        } else {
+            syscall!(unsafe {
+                libc::readlinkat(
+                    data.as_raw_descriptor(),
+                    EMPTY_CSTR.as_ptr(),
+                    buf.as_mut_ptr() as *mut libc::c_char,
+                    buf.len(),
+                )
+            })?
+        };
+
+        #[cfg(not(target_os = "macos"))]
         // SAFETY: this will only modify the contents of `buf` and we check the return value.
         let res = syscall!(unsafe {
             libc::readlinkat(
