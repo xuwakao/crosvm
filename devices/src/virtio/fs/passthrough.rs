@@ -381,6 +381,7 @@ pub(crate) struct InodeAltKey {
 enum FileType {
     Regular,
     Directory,
+    Symlink,
     Other,
 }
 
@@ -389,6 +390,7 @@ impl From<libc::mode_t> for FileType {
         match mode & libc::S_IFMT {
             libc::S_IFREG => FileType::Regular,
             libc::S_IFDIR => FileType::Directory,
+            libc::S_IFLNK => FileType::Symlink,
             _ => FileType::Other,
         }
     }
@@ -1404,12 +1406,11 @@ impl PassthroughFs {
         // be skipped later if the ZERO_MESSAGE_{OPEN,OPENDIR} features are enabled.
         // If the crosvm process doesn't have a read permission, fall back to O_PATH below.
         //
-        // Symlinks on macOS: O_PATH doesn't exist, and O_NOFOLLOW + O_RDONLY on a symlink
-        // returns ELOOP. Symlinks don't need an open fd — use /dev/null as placeholder.
+        // macOS: O_PATH doesn't exist. openat(O_NOFOLLOW) on symlinks returns ELOOP.
+        // Use /dev/null as placeholder fd — path-based operations in setattr handle
+        // chown/utime for symlinks using root_dir/path instead of the fd.
         #[cfg(target_os = "macos")]
-        if FileType::from(st.st_mode) == FileType::Other
-            && (st.st_mode as u32 & libc::S_IFMT as u32) == libc::S_IFLNK as u32
-        {
+        if FileType::from(st.st_mode) == FileType::Symlink {
             let devnull = std::fs::File::open("/dev/null").map_err(|e| {
                 io::Error::new(io::ErrorKind::Other, format!("open /dev/null: {e}"))
             })?;
@@ -1420,7 +1421,7 @@ impl PassthroughFs {
         match FileType::from(st.st_mode) {
             FileType::Regular => {}
             FileType::Directory => flags |= O_DIRECTORY,
-            FileType::Other => flags |= O_PATH,
+            FileType::Symlink | FileType::Other => flags |= O_PATH,
         };
 
         // SAFETY: this doesn't modify any memory and we check the return value.
@@ -1921,7 +1922,7 @@ impl PassthroughFs {
         match inode_data.filetype {
             FileType::Regular => {}
             FileType::Directory => return Err(io::Error::from_raw_os_error(libc::EISDIR)),
-            FileType::Other => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
+            FileType::Symlink | FileType::Other => return Err(io::Error::from_raw_os_error(libc::EINVAL)),
         }
 
         {
@@ -3121,7 +3122,6 @@ impl FileSystem for PassthroughFs {
             };
 
             // SAFETY: this doesn't modify any memory and we check the return value.
-            // macOS: AT_EMPTY_PATH not available; use fchown on the fd directly.
             #[cfg(not(target_os = "macos"))]
             syscall!(unsafe {
                 libc::fchownat(
@@ -3132,10 +3132,23 @@ impl FileSystem for PassthroughFs {
                     AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
                 )
             })?;
+            // macOS: AT_EMPTY_PATH not available. For symlinks, the fd is a
+            // /dev/null placeholder (no O_PATH), so use lchown with the full
+            // path. For regular files/dirs, fchown on the fd works fine.
             #[cfg(target_os = "macos")]
-            syscall!(unsafe {
-                libc::fchown(inode_data.as_raw_descriptor(), uid, gid)
-            })?;
+            {
+                if inode_data.filetype == FileType::Symlink {
+                    let full_path = format!("{}/{}", self.root_dir, inode_data.path);
+                    let c_path = CString::new(full_path).map_err(|_| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "path with null")
+                    })?;
+                    syscall!(unsafe { libc::lchown(c_path.as_ptr(), uid, gid) })?;
+                } else {
+                    syscall!(unsafe {
+                        libc::fchown(inode_data.as_raw_descriptor(), uid, gid)
+                    })?;
+                }
+            }
         }
 
         if valid.contains(SetattrValid::SIZE) {
@@ -3180,6 +3193,32 @@ impl FileSystem for PassthroughFs {
             }
 
             // SAFETY: this doesn't modify any memory and we check the return value.
+            // macOS: symlink fd is /dev/null placeholder. Use path-based utimensat
+            // with AT_SYMLINK_NOFOLLOW to set timestamps on the symlink itself.
+            #[cfg(target_os = "macos")]
+            if inode_data.filetype == FileType::Symlink {
+                let full_path = format!("{}/{}", self.root_dir, inode_data.path);
+                let c_path = CString::new(full_path).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "path with null")
+                })?;
+                syscall!(unsafe {
+                    libc::utimensat(
+                        libc::AT_FDCWD, c_path.as_ptr(), tvs.as_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                })?;
+            } else {
+                syscall!(unsafe {
+                    match data {
+                        Data::Handle(ref fd) => libc::futimens(fd.as_raw_descriptor(), tvs.as_ptr()),
+                        Data::ProcPath(ref p) => {
+                            libc::utimensat(self.proc.as_raw_descriptor(), p.as_ptr(), tvs.as_ptr(), 0)
+                        }
+                    }
+                })?;
+            }
+
+            #[cfg(not(target_os = "macos"))]
             syscall!(unsafe {
                 match data {
                     Data::Handle(ref fd) => libc::futimens(fd.as_raw_descriptor(), tvs.as_ptr()),
