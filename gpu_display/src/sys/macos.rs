@@ -1,6 +1,7 @@
-// macOS GPU display backend stub.
-// Currently provides a stub display (no visible window).
-// Future: Metal-based display backend for framebuffer rendering.
+// macOS GPU display backend.
+// Supports two modes:
+//   - Stub: in-memory framebuffer (no visible output)
+//   - SharedMemory: writes to mmap'd file, rendered by AetheriaDisplay.app
 
 use base::AsRawDescriptor;
 use base::RawDescriptor;
@@ -11,20 +12,34 @@ use crate::EventDevice;
 use crate::GpuDisplay;
 use crate::GpuDisplayExt;
 use crate::GpuDisplayResult;
+use crate::gpu_display_shm::DisplayShm;
 use crate::gpu_display_stub::DisplayStub;
 use crate::DisplayEventToken;
 
 pub(crate) trait MacosDisplayT: DisplayT {}
 
-// DisplayStub implements MacosDisplayT via `impl SysDisplayT for DisplayStub` in gpu_display_stub.rs
-
 pub trait MacosGpuDisplayExt {
     fn open_stub() -> GpuDisplayResult<GpuDisplay>;
+    fn open_shm() -> GpuDisplayResult<GpuDisplay>;
 }
 
 impl MacosGpuDisplayExt for GpuDisplay {
     fn open_stub() -> GpuDisplayResult<GpuDisplay> {
         let display = DisplayStub::new()?;
+        let wait_ctx = WaitContext::new()?;
+        wait_ctx.add(&display, DisplayEventToken::Display)?;
+
+        Ok(GpuDisplay {
+            inner: Box::new(display),
+            next_id: 1,
+            event_devices: Default::default(),
+            surfaces: Default::default(),
+            wait_ctx,
+        })
+    }
+
+    fn open_shm() -> GpuDisplayResult<GpuDisplay> {
+        let display = DisplayShm::new()?;
         let wait_ctx = WaitContext::new()?;
         wait_ctx.add(&display, DisplayEventToken::Display)?;
 

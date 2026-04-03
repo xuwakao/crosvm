@@ -33,6 +33,7 @@ mod event_device;
 mod gpu_display_android;
 #[cfg(feature = "android_display_stub")]
 mod gpu_display_android_stub;
+mod gpu_display_shm;
 mod gpu_display_stub;
 #[cfg(windows)]
 mod gpu_display_win;
@@ -479,6 +480,22 @@ impl GpuDisplay {
 
     pub fn open_stub() -> GpuDisplayResult<GpuDisplay> {
         let display = gpu_display_stub::DisplayStub::new()?;
+        let wait_ctx = WaitContext::new()?;
+        wait_ctx.add(&display, DisplayEventToken::Display)?;
+
+        Ok(GpuDisplay {
+            inner: Box::new(display),
+            next_id: 1,
+            event_devices: Default::default(),
+            surfaces: Default::default(),
+            wait_ctx,
+        })
+    }
+
+    /// Opens a shared memory display backend for external rendering.
+    /// Used by AetheriaDisplay.app on macOS.
+    pub fn open_shm() -> GpuDisplayResult<GpuDisplay> {
+        let display = gpu_display_shm::DisplayShm::new()?;
         let wait_ctx = WaitContext::new()?;
         wait_ctx.add(&display, DisplayEventToken::Display)?;
 

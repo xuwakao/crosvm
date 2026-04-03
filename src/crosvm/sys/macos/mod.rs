@@ -461,7 +461,7 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 vm_evt_wrtube.try_clone().context("clone vm_evt for gpu")?,
                 gpu_ctrl_device,
                 Vec::new(),       // resource_bridges
-                vec![DisplayBackend::Stub],
+                vec![DisplayBackend::SharedMemory, DisplayBackend::Stub],
                 &gpu_params,
                 None,             // rutabaga_server_descriptor
                 Vec::new(),       // event_devices
