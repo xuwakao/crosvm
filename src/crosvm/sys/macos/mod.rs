@@ -449,6 +449,8 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 use devices::virtio::gpu::GpuMode;
                 gpu_params.mode = GpuMode::ModeGfxstream;
                 gpu_params.use_vulkan = Some(true);
+                gpu_params.external_blob = true;
+                gpu_params.system_blob = true;
             }
             #[cfg(all(feature = "virgl_renderer", not(feature = "gfxstream")))]
             {

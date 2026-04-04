@@ -16,6 +16,7 @@
 //   crosvm → app: 'F' (frame ready)
 //   crosvm → app: 'R' + u32le(width) + u32le(height) (resize)
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::os::unix::net::UnixListener;
@@ -23,19 +24,24 @@ use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 
+use anyhow::bail;
 use base::AsRawDescriptor;
 use base::Event;
 use base::RawDescriptor;
 use base::VolatileSlice;
 use vm_control::gpu::DisplayParameters;
 
+use crate::DisplayExternalResourceImport;
 use crate::DisplayT;
+use crate::FlipToExtraInfo;
 use crate::GpuDisplayError;
 use crate::GpuDisplayFramebuffer;
 use crate::GpuDisplayResult;
 use crate::GpuDisplaySurface;
+use crate::SemaphoreTimepoint;
 use crate::SurfaceType;
 use crate::SysDisplayT;
+use crate::Waitable;
 
 /// Magic number for shared memory header: "AETH" (0x41455448).
 const SHM_MAGIC: u32 = 0x4845_5441; // Little-endian "AETH"
@@ -69,6 +75,26 @@ struct ShmHeader {
     active_buffer: AtomicU32, // 0 or 1 — front buffer index for reader
 }
 
+/// An imported GPU resource — mmap'd fd from gfxstream export_blob.
+struct ImportedResource {
+    /// Pointer to the mmap'd GPU memory.
+    ptr: *mut u8,
+    /// Size of the mmap'd region.
+    size: usize,
+    /// Width, height, stride of the imported image.
+    width: u32,
+    height: u32,
+    stride: u32,
+}
+
+impl Drop for ImportedResource {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.size);
+        }
+    }
+}
+
 /// Display surface backed by shared memory.
 struct ShmSurface {
     width: u32,
@@ -80,13 +106,22 @@ struct ShmSurface {
     client: Option<UnixStream>,
     /// Listener for reconnection after client disconnect.
     listener: Option<std::sync::Arc<UnixListener>>,
+    /// Shared import map — populated by DisplayShm::import_resource,
+    /// read by ShmSurface::flip_to. Shared via Arc<Mutex<>>.
+    imports: std::sync::Arc<std::sync::Mutex<HashMap<u32, ImportedResource>>>,
 }
 
 // Safety: ShmSurface is only used from the GPU thread.
 unsafe impl Send for ShmSurface {}
 
 impl ShmSurface {
-    fn new(width: u32, height: u32, client: Option<UnixStream>, listener: std::sync::Arc<UnixListener>) -> GpuDisplayResult<Self> {
+    fn new(
+        width: u32,
+        height: u32,
+        client: Option<UnixStream>,
+        listener: std::sync::Arc<UnixListener>,
+        imports: std::sync::Arc<std::sync::Mutex<HashMap<u32, ImportedResource>>>,
+    ) -> GpuDisplayResult<Self> {
         let fb_size = (width as usize) * (height as usize) * (BYTES_PER_PIXEL as usize);
         let mmap_len = SHM_HEADER_SIZE + fb_size * 2; // double buffer
 
@@ -155,6 +190,7 @@ impl ShmSurface {
             mmap_len,
             client,
             listener: Some(listener),
+            imports,
         })
     }
 
@@ -219,6 +255,36 @@ impl GpuDisplaySurface for ShmSurface {
     fn flip(&mut self) {
         self.signal_frame();
     }
+
+    fn flip_to(
+        &mut self,
+        import_id: u32,
+        _acquire_timepoint: Option<SemaphoreTimepoint>,
+        _release_timepoint: Option<SemaphoreTimepoint>,
+        _extra_info: Option<FlipToExtraInfo>,
+    ) -> anyhow::Result<Waitable> {
+        // Extract import data under lock, then release before signal_frame (needs &mut self).
+        let (src_ptr, src_size) = {
+            let imports = self.imports.lock().unwrap();
+            match imports.get(&import_id) {
+                Some(r) => (r.ptr, r.size),
+                None => bail!("import_id {} not found", import_id),
+            }
+        };
+
+        // Copy imported GPU resource to the shared memory back buffer.
+        // On Apple Silicon (unified memory), the imported fd maps to the same
+        // physical memory as the GPU texture — this memcpy is L2-cache speed.
+        let back_ptr = self.back_buffer_ptr();
+        let copy_size = self.single_buffer_size().min(src_size);
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(src_ptr, back_ptr, copy_size);
+        }
+
+        self.signal_frame();
+        Ok(Waitable::signaled())
+    }
 }
 
 impl Drop for ShmSurface {
@@ -235,6 +301,8 @@ pub struct DisplayShm {
     event: Event,
     listener: std::sync::Arc<UnixListener>,
     client: Option<UnixStream>,
+    /// Shared import map — populated here, read by ShmSurface::flip_to.
+    imports: std::sync::Arc<std::sync::Mutex<HashMap<u32, ImportedResource>>>,
 }
 
 impl DisplayShm {
@@ -260,6 +328,7 @@ impl DisplayShm {
             event,
             listener: std::sync::Arc::new(listener),
             client: None,
+            imports: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 
@@ -282,6 +351,86 @@ impl DisplayShm {
 }
 
 impl DisplayT for DisplayShm {
+    fn import_resource(
+        &mut self,
+        import_id: u32,
+        _surface_id: u32,
+        external_display_resource: DisplayExternalResourceImport,
+    ) -> anyhow::Result<()> {
+        match external_display_resource {
+            DisplayExternalResourceImport::Dmabuf {
+                descriptor,
+                offset: _,
+                stride,
+                modifiers: _,
+                width,
+                height,
+                fourcc: _,
+            } => {
+                let fd = descriptor.as_raw_descriptor();
+
+                // Get the size of the backing memory.
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                let stat_ret = unsafe { libc::fstat(fd, &mut stat) };
+                let size = if stat_ret == 0 && stat.st_size > 0 {
+                    stat.st_size as usize
+                } else {
+                    // Fallback: use dimensions if fstat fails (common with opaque fds).
+                    (height as usize) * (stride as usize)
+                };
+
+                if size == 0 {
+                    bail!("import_resource: zero size for import_id {}", import_id);
+                }
+
+                let ptr = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        size,
+                        libc::PROT_READ,
+                        libc::MAP_SHARED,
+                        fd,
+                        0,
+                    )
+                };
+
+                if ptr == libc::MAP_FAILED {
+                    bail!(
+                        "import_resource: mmap failed for import_id {} (fd={}, size={})",
+                        import_id, fd, size
+                    );
+                }
+
+                let resource = ImportedResource {
+                    ptr: ptr as *mut u8,
+                    size,
+                    width,
+                    height,
+                    stride,
+                };
+
+                eprintln!(
+                    "[shm-display] imported resource {}: {}x{} stride={} size={}",
+                    import_id, width, height, stride, size
+                );
+
+                self.imports.lock().unwrap().insert(import_id, resource);
+                Ok(())
+            }
+            _ => {
+                // VulkanImage, VulkanTimelineSemaphore, AHardwareBuffer — not supported.
+                // Let the caller fall back to transfer_read.
+                bail!("import_resource: only Dmabuf supported on SharedMemory backend")
+            }
+        }
+    }
+
+    fn release_import(&mut self, import_id: u32, _surface_id: u32) {
+        if self.imports.lock().unwrap().remove(&import_id).is_some() {
+            eprintln!("[shm-display] released import {}", import_id);
+        }
+    }
+
     fn create_surface(
         &mut self,
         parent_surface_id: Option<u32>,
@@ -298,7 +447,7 @@ impl DisplayT for DisplayShm {
         self.try_accept();
 
         let (width, height) = display_params.get_virtual_display_size();
-        let surface = ShmSurface::new(width, height, self.client.take(), self.listener.clone())?;
+        let surface = ShmSurface::new(width, height, self.client.take(), self.listener.clone(), self.imports.clone())?;
         Ok(Box::new(surface))
     }
 }
