@@ -47,6 +47,15 @@ const SOCKET_PATH: &str = "/tmp/aetheria-display.sock";
 
 /// Shared memory header, mapped at offset 0 of the shm file.
 /// All fields are little-endian u32.
+///
+/// Double-buffered layout:
+///   Offset 0:                ShmHeader (padded to 4096)
+///   Offset 4096:             Buffer 0 (width * height * 4)
+///   Offset 4096 + fb_size:   Buffer 1 (width * height * 4)
+///
+/// crosvm writes to the BACK buffer (1 - active_buffer).
+/// On flip(), active_buffer is swapped atomically.
+/// Swift app reads from FRONT buffer (active_buffer).
 #[repr(C)]
 struct ShmHeader {
     magic: u32,
@@ -54,9 +63,9 @@ struct ShmHeader {
     width: u32,
     height: u32,
     stride: u32,
-    format: u32, // DRM_FORMAT_XRGB8888 = 0x34325258
+    format: u32,          // DRM_FORMAT_XRGB8888 = 0x34325258
     frame_seq: AtomicU32,
-    flags: u32,
+    active_buffer: AtomicU32, // 0 or 1 — front buffer index for reader
 }
 
 /// Display surface backed by shared memory.
@@ -78,7 +87,7 @@ unsafe impl Send for ShmSurface {}
 impl ShmSurface {
     fn new(width: u32, height: u32, client: Option<UnixStream>, listener: std::sync::Arc<UnixListener>) -> GpuDisplayResult<Self> {
         let fb_size = (width as usize) * (height as usize) * (BYTES_PER_PIXEL as usize);
-        let mmap_len = SHM_HEADER_SIZE + fb_size;
+        let mmap_len = SHM_HEADER_SIZE + fb_size * 2; // double buffer
 
         // Create and size the shared memory file.
         let file = fs::OpenOptions::new()
@@ -125,7 +134,7 @@ impl ShmSurface {
         header.stride = width * BYTES_PER_PIXEL;
         header.format = 0x3432_5258; // DRM_FORMAT_XRGB8888
         header.frame_seq = AtomicU32::new(0);
-        header.flags = 0;
+        header.active_buffer = AtomicU32::new(0);
         // Memory barrier before writing magic to ensure all fields are visible.
         std::sync::atomic::fence(Ordering::Release);
         header.magic = SHM_MAGIC;
@@ -148,12 +157,17 @@ impl ShmSurface {
         })
     }
 
-    fn framebuffer_ptr(&mut self) -> *mut u8 {
-        unsafe { self.mmap_ptr.add(SHM_HEADER_SIZE) }
+    fn single_buffer_size(&self) -> usize {
+        (self.width as usize) * (self.height as usize) * (BYTES_PER_PIXEL as usize)
     }
 
-    fn framebuffer_size(&self) -> usize {
-        (self.width as usize) * (self.height as usize) * (BYTES_PER_PIXEL as usize)
+    /// Returns pointer to the BACK buffer (the one crosvm writes to).
+    /// Back buffer = 1 - active_buffer.
+    fn back_buffer_ptr(&mut self) -> *mut u8 {
+        let active = self.header().active_buffer.load(Ordering::Acquire);
+        let back = 1 - active;
+        let offset = SHM_HEADER_SIZE + (back as usize) * self.single_buffer_size();
+        unsafe { self.mmap_ptr.add(offset) }
     }
 
     fn header(&self) -> &ShmHeader {
@@ -161,6 +175,10 @@ impl ShmSurface {
     }
 
     fn signal_frame(&mut self) {
+        // Swap buffers: the back buffer (just written) becomes the front buffer.
+        let old_active = self.header().active_buffer.load(Ordering::Acquire);
+        self.header().active_buffer.store(1 - old_active, Ordering::Release);
+
         // Increment frame sequence number.
         self.header().frame_seq.fetch_add(1, Ordering::Release);
 
@@ -187,11 +205,12 @@ impl ShmSurface {
 
 impl GpuDisplaySurface for ShmSurface {
     fn framebuffer(&mut self) -> Option<GpuDisplayFramebuffer> {
-        let fb_ptr = self.framebuffer_ptr();
-        let fb_size = self.framebuffer_size();
+        let fb_ptr = self.back_buffer_ptr();
+        let fb_size = self.single_buffer_size();
         let stride = self.width * BYTES_PER_PIXEL;
 
         // Safety: the mmap'd region is valid for the lifetime of ShmSurface.
+        // Returns the back buffer — crosvm writes here while Swift reads from front.
         let slice = unsafe { VolatileSlice::from_raw_parts(fb_ptr, fb_size) };
         Some(GpuDisplayFramebuffer::new(slice, stride, BYTES_PER_PIXEL))
     }
