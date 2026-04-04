@@ -1061,26 +1061,42 @@ impl Worker {
         // a `WorkerRequest::Activate`, the worker will remain in `run_until_sleep_or_exit()`
         // until suspended via `kill_evt` or `suspend_evt` being signaled.
         loop {
+            eprintln!("[gpu-worker] waiting for request...");
             let request = match self.request_receiver.recv() {
-                Ok(r) => r,
+                Ok(r) => {
+                    eprintln!("[gpu-worker] got request: {:?}", std::mem::discriminant(&r));
+                    r
+                }
                 Err(_) => {
-                    info!("virtio gpu worker connection ended, exiting.");
+                    eprintln!("[gpu-worker] channel CLOSED — sender dropped. Exiting.");
                     return;
                 }
             };
 
             match request {
                 WorkerRequest::Activate(request) => {
-                    let response = self.on_activate(request).map(|_| WorkerResponse::Ok);
+                    eprintln!("[gpu-worker] on_activate starting...");
+                    let response = self.on_activate(request);
+                    match &response {
+                        Ok(_) => eprintln!("[gpu-worker] on_activate OK"),
+                        Err(e) => eprintln!("[gpu-worker] on_activate FAILED: {:#}", e),
+                    }
                     self.response_sender
-                        .send(response)
+                        .send(response.map(|_| WorkerResponse::Ok))
                         .expect("failed to send gpu worker response for activate");
 
+                    eprintln!("[gpu-worker] entering run_until_sleep_or_exit...");
                     let stop_reason = self
-                        .run_until_sleep_or_exit()
-                        .expect("failed to run gpu worker processing");
+                        .run_until_sleep_or_exit();
+                    match &stop_reason {
+                        Ok(WorkerStopReason::Kill) => eprintln!("[gpu-worker] run returned: Kill"),
+                        Ok(WorkerStopReason::Sleep) => eprintln!("[gpu-worker] run returned: Sleep"),
+                        Err(e) => eprintln!("[gpu-worker] run FAILED: {:#}", e),
+                    }
+                    let stop_reason = stop_reason.expect("failed to run gpu worker processing");
 
                     if let WorkerStopReason::Kill = stop_reason {
+                        eprintln!("[gpu-worker] breaking out of loop (Kill)");
                         break;
                     }
                 }
@@ -2147,6 +2163,7 @@ impl VirtioDevice for Gpu {
 
 impl Drop for Gpu {
     fn drop(&mut self) {
+        eprintln!("[gpu] WARNING: Gpu struct is being DROPPED!");
         let _ = self.reset();
     }
 }

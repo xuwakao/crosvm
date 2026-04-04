@@ -461,16 +461,20 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             // Dropping (not forgetting) is safe: the device tube remains valid as long
             // as the Tube pair's internal fd is not closed, but Rust's Drop on Tube
             // DOES close. Use forget to keep device-side connected.
-            let (_gpu_ctrl_host, gpu_ctrl_device) =
+            let (gpu_ctrl_host, gpu_ctrl_device) =
                 Tube::pair().context("gpu control tube")?;
-            let (_msi_tube, msi_device_tube) =
+            let (msi_tube, msi_device_tube) =
                 Tube::pair().context("gpu MSI tube")?;
             let (ioevent_tube, ioevent_device_tube) =
                 Tube::pair().context("gpu ioevent tube")?;
-            let (_vm_tube, vm_device_tube) =
+            let (vm_tube, vm_device_tube) =
                 Tube::pair().context("gpu vm tube")?;
-            // ioevent host tube must outlive device (same as blk/net).
+            // Host-side tubes must outlive the GPU device. Dropping them closes the fd,
+            // which triggers a hangup on the device side → worker Kill → display dies.
+            std::mem::forget(gpu_ctrl_host);
+            std::mem::forget(msi_tube);
             std::mem::forget(ioevent_tube);
+            std::mem::forget(vm_tube);
 
             let gpu_dev = Gpu::new(
                 vm_evt_wrtube.try_clone().context("clone vm_evt for gpu")?,
