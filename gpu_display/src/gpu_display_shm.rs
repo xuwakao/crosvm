@@ -87,6 +87,11 @@ struct ImportedResource {
     stride: u32,
 }
 
+// Safety: ImportedResource contains a raw pointer from mmap. The mmap'd region
+// is valid for the lifetime of the resource (munmap in Drop). Access is serialized
+// via Mutex in the shared imports map.
+unsafe impl Send for ImportedResource {}
+
 impl Drop for ImportedResource {
     fn drop(&mut self) {
         unsafe {
@@ -264,22 +269,34 @@ impl GpuDisplaySurface for ShmSurface {
         _extra_info: Option<FlipToExtraInfo>,
     ) -> anyhow::Result<Waitable> {
         // Extract import data under lock, then release before signal_frame (needs &mut self).
-        let (src_ptr, src_size) = {
+        let (src_ptr, src_stride, src_height) = {
             let imports = self.imports.lock().unwrap();
             match imports.get(&import_id) {
-                Some(r) => (r.ptr, r.size),
+                Some(r) => (r.ptr, r.stride as usize, r.height as usize),
                 None => bail!("import_id {} not found", import_id),
             }
         };
 
-        // Copy imported GPU resource to the shared memory back buffer.
-        // On Apple Silicon (unified memory), the imported fd maps to the same
-        // physical memory as the GPU texture — this memcpy is L2-cache speed.
         let back_ptr = self.back_buffer_ptr();
-        let copy_size = self.single_buffer_size().min(src_size);
+        let dst_stride = (self.width as usize) * (BYTES_PER_PIXEL as usize);
+        let rows = (self.height as usize).min(src_height);
+        let row_bytes = dst_stride.min(src_stride);
 
-        unsafe {
-            std::ptr::copy_nonoverlapping(src_ptr, back_ptr, copy_size);
+        if src_stride == dst_stride {
+            // Fast path: strides match, single memcpy.
+            let copy_size = rows * dst_stride;
+            unsafe {
+                std::ptr::copy_nonoverlapping(src_ptr, back_ptr, copy_size);
+            }
+        } else {
+            // Stride mismatch: copy row by row to handle GPU alignment padding.
+            for row in 0..rows {
+                unsafe {
+                    let src = src_ptr.add(row * src_stride);
+                    let dst = back_ptr.add(row * dst_stride);
+                    std::ptr::copy_nonoverlapping(src, dst, row_bytes);
+                }
+            }
         }
 
         self.signal_frame();
