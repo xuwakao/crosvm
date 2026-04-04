@@ -7,9 +7,10 @@
 // signals frame readiness via a Unix socket. An external process
 // (AetheriaDisplay.app) reads the shared memory and renders via Metal.
 //
-// Shared memory layout:
-//   Offset 0:    ShmHeader (32 bytes, padded to 4096)
-//   Offset 4096: Framebuffer data (width * height * 4 bytes, XRGB8888)
+// Shared memory layout (double-buffered):
+//   Offset 0:                ShmHeader (padded to 4096)
+//   Offset 4096:             Buffer 0 (width * height * 4, XRGB8888)
+//   Offset 4096 + fb_size:   Buffer 1 (width * height * 4, XRGB8888)
 //
 // Control socket protocol:
 //   crosvm → app: 'F' (frame ready)
@@ -164,7 +165,7 @@ impl ShmSurface {
     /// Returns pointer to the BACK buffer (the one crosvm writes to).
     /// Back buffer = 1 - active_buffer.
     fn back_buffer_ptr(&mut self) -> *mut u8 {
-        let active = self.header().active_buffer.load(Ordering::Acquire);
+        let active = self.header().active_buffer.load(Ordering::Acquire) & 1;
         let back = 1 - active;
         let offset = SHM_HEADER_SIZE + (back as usize) * self.single_buffer_size();
         unsafe { self.mmap_ptr.add(offset) }
@@ -176,7 +177,7 @@ impl ShmSurface {
 
     fn signal_frame(&mut self) {
         // Swap buffers: the back buffer (just written) becomes the front buffer.
-        let old_active = self.header().active_buffer.load(Ordering::Acquire);
+        let old_active = self.header().active_buffer.load(Ordering::Acquire) & 1;
         self.header().active_buffer.store(1 - old_active, Ordering::Release);
 
         // Increment frame sequence number.
