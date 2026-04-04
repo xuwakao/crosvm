@@ -147,6 +147,14 @@ impl ShmSurface {
             GpuDisplayError::CreateSurface
         })?;
 
+        // Make shm file readable by display app (crosvm runs as root).
+        unsafe {
+            libc::chmod(
+                std::ffi::CString::new(SHM_PATH).unwrap().as_ptr(),
+                0o666,
+            );
+        }
+
         // mmap the file.
         let mmap_ptr = unsafe {
             libc::mmap(
@@ -333,6 +341,23 @@ impl DisplayShm {
             eprintln!("[shm-display] bind socket {}: {}", SOCKET_PATH, e);
             GpuDisplayError::CreateEvent
         })?;
+
+        // crosvm runs as root (sudo for vmnet). Make socket world-accessible
+        // so the display app (running as the normal user) can connect.
+        unsafe {
+            libc::chmod(
+                std::ffi::CString::new(SOCKET_PATH).unwrap().as_ptr(),
+                0o777,
+            );
+        }
+
+        // Same for shared memory file.
+        unsafe {
+            libc::chmod(
+                std::ffi::CString::new(SHM_PATH).unwrap().as_ptr(),
+                0o666,
+            );
+        }
 
         // Non-blocking so we can check for connections without blocking the GPU thread.
         listener
