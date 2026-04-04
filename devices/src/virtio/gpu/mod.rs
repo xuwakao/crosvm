@@ -2131,12 +2131,16 @@ impl VirtioDevice for Gpu {
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
-        self.stop_worker_thread();
-        // Restart the worker so the display backend survives guest driver resets.
-        // The guest virtio-gpu driver resets the device during its init sequence,
-        // then re-activates. Without restarting, the SharedMemory display socket
-        // is closed and the external display app can never connect.
-        self.start_worker_thread();
+        // Do NOT stop the worker thread on reset. The guest virtio-gpu driver
+        // resets the device during its init sequence, then re-activates.
+        // Stopping the worker would destroy the SharedMemory display socket,
+        // preventing the external display app from connecting.
+        //
+        // The worker thread remains in its event loop, waiting for a new
+        // Activate message. The display backend and its Unix socket survive
+        // across guest driver resets.
+        //
+        // Only truly stop on Drop (when the VM is shutting down).
         Ok(())
     }
 }
