@@ -2132,6 +2132,11 @@ impl VirtioDevice for Gpu {
 
     fn reset(&mut self) -> anyhow::Result<()> {
         self.stop_worker_thread();
+        // Restart the worker so the display backend survives guest driver resets.
+        // The guest virtio-gpu driver resets the device during its init sequence,
+        // then re-activates. Without restarting, the SharedMemory display socket
+        // is closed and the external display app can never connect.
+        self.start_worker_thread();
         Ok(())
     }
 }

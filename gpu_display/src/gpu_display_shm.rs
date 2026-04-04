@@ -496,6 +496,12 @@ impl DisplayT for DisplayShm {
 
 impl SysDisplayT for DisplayShm {}
 
+impl Drop for DisplayShm {
+    fn drop(&mut self) {
+        eprintln!("[shm-display] display backend shutting down");
+    }
+}
+
 impl AsRawDescriptor for DisplayShm {
     fn as_raw_descriptor(&self) -> RawDescriptor {
         self.event.as_raw_descriptor()
