@@ -68,13 +68,15 @@ struct ShmSurface {
     mmap_len: usize,
     /// Connected display app (if any).
     client: Option<UnixStream>,
+    /// Listener for reconnection after client disconnect.
+    listener: Option<std::sync::Arc<UnixListener>>,
 }
 
 // Safety: ShmSurface is only used from the GPU thread.
 unsafe impl Send for ShmSurface {}
 
 impl ShmSurface {
-    fn new(width: u32, height: u32, client: Option<UnixStream>) -> GpuDisplayResult<Self> {
+    fn new(width: u32, height: u32, client: Option<UnixStream>, listener: std::sync::Arc<UnixListener>) -> GpuDisplayResult<Self> {
         let fb_size = (width as usize) * (height as usize) * (BYTES_PER_PIXEL as usize);
         let mmap_len = SHM_HEADER_SIZE + fb_size;
 
@@ -114,9 +116,9 @@ impl ShmSurface {
 
         let mmap_ptr = mmap_ptr as *mut u8;
 
-        // Write header.
+        // Write header. Magic is written LAST — the reader checks magic first,
+        // so all other fields are guaranteed initialized when magic is valid.
         let header = unsafe { &mut *(mmap_ptr as *mut ShmHeader) };
-        header.magic = SHM_MAGIC;
         header.version = SHM_VERSION;
         header.width = width;
         header.height = height;
@@ -124,6 +126,9 @@ impl ShmSurface {
         header.format = 0x3432_5258; // DRM_FORMAT_XRGB8888
         header.frame_seq = AtomicU32::new(0);
         header.flags = 0;
+        // Memory barrier before writing magic to ensure all fields are visible.
+        std::sync::atomic::fence(Ordering::Release);
+        header.magic = SHM_MAGIC;
 
         eprintln!(
             "[shm-display] surface created: {}x{}, shm={}, socket={}",
@@ -139,6 +144,7 @@ impl ShmSurface {
             mmap_ptr,
             mmap_len,
             client,
+            listener: Some(listener),
         })
     }
 
@@ -163,6 +169,17 @@ impl ShmSurface {
             if client.write_all(b"F").is_err() {
                 eprintln!("[shm-display] client disconnected");
                 self.client = None;
+            }
+        }
+
+        // Try to accept a new client if disconnected.
+        if self.client.is_none() {
+            if let Some(ref listener) = self.listener {
+                if let Ok((stream, _)) = listener.accept() {
+                    eprintln!("[shm-display] display app reconnected");
+                    stream.set_nonblocking(true).ok();
+                    self.client = Some(stream);
+                }
             }
         }
     }
@@ -196,7 +213,7 @@ impl Drop for ShmSurface {
 /// Shared memory display backend.
 pub struct DisplayShm {
     event: Event,
-    listener: UnixListener,
+    listener: std::sync::Arc<UnixListener>,
     client: Option<UnixStream>,
 }
 
@@ -221,7 +238,7 @@ impl DisplayShm {
 
         Ok(DisplayShm {
             event,
-            listener,
+            listener: std::sync::Arc::new(listener),
             client: None,
         })
     }
@@ -261,7 +278,7 @@ impl DisplayT for DisplayShm {
         self.try_accept();
 
         let (width, height) = display_params.get_virtual_display_size();
-        let surface = ShmSurface::new(width, height, self.client.take())?;
+        let surface = ShmSurface::new(width, height, self.client.take(), self.listener.clone())?;
         Ok(Box::new(surface))
     }
 }
