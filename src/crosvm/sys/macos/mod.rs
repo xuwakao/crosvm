@@ -441,7 +441,13 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             use devices::virtio::gpu::{DisplayBackend, Gpu, GpuParameters};
             use vm_control::api::VmMemoryClient;
 
-            let gpu_params = GpuParameters::default();
+            let mut gpu_params = GpuParameters::default();
+            // Enable virglrenderer 3D mode if available (linked against libvirglrenderer.dylib).
+            #[cfg(feature = "virgl_renderer")]
+            {
+                use devices::virtio::gpu::GpuMode;
+                gpu_params.mode = GpuMode::ModeVirglRenderer;
+            }
             // Host-side tubes kept alive via _prefix — device-side tubes passed to GPU.
             // Dropping (not forgetting) is safe: the device tube remains valid as long
             // as the Tube pair's internal fd is not closed, but Rust's Drop on Tube
