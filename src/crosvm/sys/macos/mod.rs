@@ -442,8 +442,14 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             use vm_control::api::VmMemoryClient;
 
             let mut gpu_params = GpuParameters::default();
-            // Enable virglrenderer 3D mode if available (linked against libvirglrenderer.dylib).
-            #[cfg(feature = "virgl_renderer")]
+            // Enable 3D acceleration if available.
+            // Priority: gfxstream (Vulkan) > virglrenderer (OpenGL) > 2D (default).
+            #[cfg(feature = "gfxstream")]
+            {
+                use devices::virtio::gpu::GpuMode;
+                gpu_params.mode = GpuMode::ModeGfxstream;
+            }
+            #[cfg(all(feature = "virgl_renderer", not(feature = "gfxstream")))]
             {
                 use devices::virtio::gpu::GpuMode;
                 gpu_params.mode = GpuMode::ModeVirglRenderer;
