@@ -461,11 +461,15 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             {
                 use devices::virtio::gpu::GpuMode;
                 gpu_params.mode = GpuMode::ModeVirglRenderer;
-                // macOS has no EGL/GLES — disable GL path.
-                // Venus (Vulkan forwarding) works without EGL.
+                // macOS: Venus-only mode (Vulkan forwarding via MoltenVK).
+                // Disable EGL/GLES (no native EGL on macOS).
+                // Set capset_mask to Venus-only — this sets NO_VIRGL flag,
+                // preventing vrend OpenGL initialization (which needs EGL).
                 gpu_params.renderer_use_egl = false;
                 gpu_params.renderer_use_gles = false;
                 gpu_params.renderer_use_surfaceless = false;
+                // capset_mask bit 4 = Venus (capset ID 4)
+                gpu_params.capset_mask = 1 << 4;
             }
             // Host-side tubes kept alive via _prefix — device-side tubes passed to GPU.
             // Dropping (not forgetting) is safe: the device tube remains valid as long
