@@ -442,6 +442,7 @@ impl VirtioGpuScanout {
             // SAFETY: trivially safe
             unsafe { std::slice::from_raw_parts_mut(fb_slice.as_mut_ptr(), fb_slice.size()) },
         );
+
         rutabaga.transfer_read(0, resource.resource_id, transfer, Some(buf))?;
 
         display.flip(surface_id);
