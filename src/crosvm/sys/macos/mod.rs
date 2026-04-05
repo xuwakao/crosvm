@@ -449,11 +449,11 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 use devices::virtio::gpu::GpuMode;
                 gpu_params.mode = GpuMode::ModeGfxstream;
                 gpu_params.use_vulkan = Some(true);
-                // Disable GLES/EGL — macOS has no ANGLE libraries.
-                // gfxstream runs in Vulkan-only mode via MoltenVK → Metal.
-                gpu_params.renderer_use_egl = false;
-                gpu_params.renderer_use_gles = false;
-                gpu_params.renderer_use_surfaceless = false;
+                // ANGLE provides EGL/GLES on macOS (OpenGL ES → Metal translation).
+                // gfxstream uses ANGLE for OpenGL ES + MoltenVK for Vulkan.
+                gpu_params.renderer_use_egl = true;
+                gpu_params.renderer_use_gles = true;
+                gpu_params.renderer_use_surfaceless = true;
                 gpu_params.external_blob = true;
                 gpu_params.system_blob = true;
             }
@@ -461,6 +461,11 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             {
                 use devices::virtio::gpu::GpuMode;
                 gpu_params.mode = GpuMode::ModeVirglRenderer;
+                // macOS has no EGL/GLES — disable GL path.
+                // Venus (Vulkan forwarding) works without EGL.
+                gpu_params.renderer_use_egl = false;
+                gpu_params.renderer_use_gles = false;
+                gpu_params.renderer_use_surfaceless = false;
             }
             // Host-side tubes kept alive via _prefix — device-side tubes passed to GPU.
             // Dropping (not forgetting) is safe: the device tube remains valid as long
