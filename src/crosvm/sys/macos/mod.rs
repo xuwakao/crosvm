@@ -457,18 +457,14 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 gpu_params.external_blob = true;
                 gpu_params.system_blob = true;
             }
-            #[cfg(all(feature = "virgl_renderer", not(feature = "gfxstream")))]
-            {
-                // macOS: Keep Mode2D as default for fbcon/2D resources.
-                // Add Venus capset for Vulkan forwarding via MoltenVK.
-                // Do NOT set ModeVirglRenderer — that makes VirglRenderer the
-                // default component, breaking 2D resource handling.
-                gpu_params.renderer_use_egl = false;
-                gpu_params.renderer_use_gles = false;
-                gpu_params.renderer_use_surfaceless = false;
-                // Venus capset (ID 4) — enables Vulkan forwarding alongside 2D display.
-                gpu_params.capset_mask = 1 << 4;
-            }
+            // NOTE: virgl_renderer/gfxstream 3D acceleration on macOS is WIP.
+            // Current blockers:
+            //   - virglrenderer: Venus + 2D coexistence requires rutabaga change
+            //     (capset_mask overrides default component to VirglRenderer,
+            //     breaking 2D resource handling for fbcon)
+            //   - gfxstream: ANGLE initialization causes process kill on macOS
+            // For now, GPU runs in 2D mode (Rutabaga2D) with SharedMemory display.
+            // virglrenderer/gfxstream dylibs are compiled and linked but not activated.
             // Host-side tubes kept alive via _prefix — device-side tubes passed to GPU.
             // Dropping (not forgetting) is safe: the device tube remains valid as long
             // as the Tube pair's internal fd is not closed, but Rust's Drop on Tube
