@@ -449,6 +449,11 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 use devices::virtio::gpu::GpuMode;
                 gpu_params.mode = GpuMode::ModeGfxstream;
                 gpu_params.use_vulkan = Some(true);
+                // Disable GLES/EGL — macOS has no ANGLE libraries.
+                // gfxstream runs in Vulkan-only mode via MoltenVK → Metal.
+                gpu_params.renderer_use_egl = false;
+                gpu_params.renderer_use_gles = false;
+                gpu_params.renderer_use_surfaceless = false;
                 gpu_params.external_blob = true;
                 gpu_params.system_blob = true;
             }
