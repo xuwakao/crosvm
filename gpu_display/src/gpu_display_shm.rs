@@ -364,20 +364,11 @@ impl DisplayShm {
             .set_nonblocking(true)
             .map_err(|_| GpuDisplayError::CreateEvent)?;
 
-        // Keep a global reference to the listener so it's NEVER dropped,
-        // even if DisplayShm gets dropped during guest driver reset.
-        static KEEPER: std::sync::Mutex<Option<std::sync::Arc<UnixListener>>> = std::sync::Mutex::new(None);
-        let listener_arc = std::sync::Arc::new(listener);
-        *KEEPER.lock().unwrap() = Some(listener_arc.clone());
-
-        // Use try_unwrap to get ownership back, or keep the Arc
-        let listener = listener_arc;
-
         eprintln!("[shm-display] listening on {}", SOCKET_PATH);
 
         Ok(DisplayShm {
             event,
-            listener,
+            listener: std::sync::Arc::new(listener),
             client: None,
             imports: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
@@ -504,13 +495,6 @@ impl DisplayT for DisplayShm {
 }
 
 impl SysDisplayT for DisplayShm {}
-
-impl Drop for DisplayShm {
-    fn drop(&mut self) {
-        eprintln!("[shm-display] DisplayShm DROPPED — listener fd will close");
-    }
-}
-
 
 impl AsRawDescriptor for DisplayShm {
     fn as_raw_descriptor(&self) -> RawDescriptor {
