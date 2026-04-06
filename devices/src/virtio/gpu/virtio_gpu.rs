@@ -1136,11 +1136,19 @@ impl VirtioGpu {
 
         let guest_cpu_mappable =
             (resource_create_blob.blob_flags & VIRTIO_GPU_BLOB_FLAG_USE_MAPPABLE) != 0;
+        // On macOS/Apple Silicon, hv_vm_map requires 16KB-aligned sizes.
+        // Pad blob resource size to prevent adjacent blobs from overlapping
+        // within the same 16KB HVF page.
+        #[cfg(target_os = "macos")]
+        let blob_size = (resource_create_blob.size + 0x3FFF) & !0x3FFF;
+        #[cfg(not(target_os = "macos"))]
+        let blob_size = resource_create_blob.size;
+
         let resource = VirtioGpuResource::new(
             resource_id,
             0,
             0,
-            resource_create_blob.size,
+            blob_size,
             guest_cpu_mappable,
         );
 

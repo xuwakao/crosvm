@@ -2703,8 +2703,6 @@ dependencies = [
 [[package]]
 name = "rutabaga_gfx"
 version = "0.1.76-alpha.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "988c93caed844e77bcb3c3988d89d249408aa772702b543c980d49b6665fb5fd"
 dependencies = [
  "cfg-if",
  "libc",

@@ -49,6 +49,8 @@ use vm_memory::MemoryPolicy;
 use crate::crosvm::config::Config;
 use crate::crosvm::config::Executable;
 
+// (HvfSharedMemoryMapper removed — using tube handler thread instead)
+
 #[cfg(target_arch = "aarch64")]
 type Arch = aarch64::AArch64;
 
@@ -433,6 +435,10 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             }
         }
 
+        // GPU shared memory tube — host side handled by a thread after build_vm.
+        #[cfg(feature = "gpu")]
+        let mut gpu_shmem_host_tube: Option<Tube> = None;
+
         // GPU device: virtio-gpu with Rutabaga2D software backend.
         // Provides /dev/dri/card0 in guest for Mesa software rendering.
         #[cfg(feature = "gpu")]
@@ -457,14 +463,27 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                 gpu_params.external_blob = true;
                 gpu_params.system_blob = true;
             }
-            // NOTE: virgl_renderer/gfxstream 3D acceleration on macOS is WIP.
-            // Current blockers:
-            //   - virglrenderer: Venus + 2D coexistence requires rutabaga change
-            //     (capset_mask overrides default component to VirglRenderer,
-            //     breaking 2D resource handling for fbcon)
-            //   - gfxstream: ANGLE initialization causes process kill on macOS
-            // For now, GPU runs in 2D mode (Rutabaga2D) with SharedMemory display.
-            // virglrenderer/gfxstream dylibs are compiled and linked but not activated.
+            #[cfg(all(feature = "virgl_renderer", not(feature = "gfxstream")))]
+            {
+                use devices::virtio::gpu::GpuMode;
+                gpu_params.mode = GpuMode::ModeVirglRenderer;
+                // Venus only — NO_VIRGL avoids OpenGL init (not available on macOS).
+                // capset_mask bit 4 = RUTABAGA_CAPSET_VENUS (Vulkan forwarding via MoltenVK).
+                // Rutabaga2D always initialized (patched rutabaga_core.rs) handles fbcon/cursor.
+                gpu_params.capset_mask = 1 << 4;
+                // Disable EGL/GLES — not available natively on macOS.
+                gpu_params.renderer_use_egl = false;
+                gpu_params.renderer_use_gles = false;
+                gpu_params.renderer_use_surfaceless = false;
+                // Venus requires the render server (proxy) to be initialized.
+                // virglrenderer only sets proxy_initialized when RENDER_SERVER flag is set.
+                gpu_params.allow_implicit_render_server_exec = true;
+                // macOS/Apple Silicon uses 16KB pages. fixed_blob_mapping pre-allocates
+                // the entire host_visible BAR, then maps individual blobs via add_fd_mapping
+                // (which respects page alignment). Without this, per-blob hv_vm_map calls
+                // fail due to 4KB-offset blobs not being 16KB-aligned.
+                gpu_params.fixed_blob_mapping = true;
+            }
             // Host-side tubes kept alive via _prefix — device-side tubes passed to GPU.
             // Dropping (not forgetting) is safe: the device tube remains valid as long
             // as the Tube pair's internal fd is not closed, but Rust's Drop on Tube
@@ -497,8 +516,11 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
             );
 
             // GPU has shared memory regions — need a real VmMemoryClient.
-            let (_shmem_host_tube, shmem_device_tube) =
+            // The host tube is serviced by a handler thread (spawned after build_vm)
+            // that calls VmMemoryRequest::execute with the VM and allocator.
+            let (gpu_shmem_tube_host, shmem_device_tube) =
                 Tube::pair().context("gpu shmem tube")?;
+            gpu_shmem_host_tube = Some(gpu_shmem_tube_host);
 
             match VirtioPciDevice::new(
                 guest_mem_for_pci.clone(),
@@ -621,6 +643,22 @@ pub fn run_config(cfg: Config) -> Result<ExitState> {
                     fs_mapping_handler_thread(vm_for_fs, allocator_for_fs, fs_tube);
                 })
                 .context("failed to spawn fs handler thread")?)
+        } else {
+            None
+        };
+
+        // Spawn GPU VmMemory handler thread — processes VmMemoryRequest from
+        // the GPU device (RegisterMemory for blob mapping, used by Venus ring buffer).
+        #[cfg(feature = "gpu")]
+        let _gpu_shmem_handler = if let Some(tube) = gpu_shmem_host_tube {
+            let vm_for_gpu = linux.vm.try_clone().context("clone VM for gpu shmem handler")?;
+            let allocator_for_gpu = sys_allocator.clone();
+            Some(thread::Builder::new()
+                .name("gpu_shmem".into())
+                .spawn(move || {
+                    gpu_shmem_handler_thread(vm_for_gpu, allocator_for_gpu, tube);
+                })
+                .context("failed to spawn gpu shmem handler thread")?)
         } else {
             None
         };
@@ -1096,6 +1134,47 @@ fn fs_mapping_handler_thread(
     }
 
     info!("FS mapping handler thread exiting");
+}
+
+/// GPU VmMemory handler thread — processes VmMemoryRequest from the GPU device.
+/// Handles RegisterMemory (blob mapping for Venus ring buffer) and UnregisterMemory.
+/// This mirrors Linux's VmControl tube handling in run_control().
+#[cfg(feature = "gpu")]
+fn gpu_shmem_handler_thread(
+    mut vm: impl hypervisor::Vm,
+    sys_allocator: Arc<sync::Mutex<SystemAllocator>>,
+    tube: Tube,
+) {
+    use rutabaga_gfx::RutabagaGralloc;
+    use vm_control::VmMemoryRegionState;
+    use vm_control::VmMemoryRequest;
+    use vm_control::VmMemoryResponse;
+
+    info!("GPU shmem handler thread started");
+
+    let mut gralloc = RutabagaGralloc::new(
+        rutabaga_gfx::RutabagaGrallocBackendFlags::new(),
+    ).expect("failed to create gralloc");
+    let mut region_state = VmMemoryRegionState::default();
+
+    loop {
+        match tube.recv::<VmMemoryRequest>() {
+            Ok(request) => {
+                let response = request.execute(
+                    &mut vm,
+                    &mut sys_allocator.lock(),
+                    &mut gralloc,
+                    None,
+                    &mut region_state,
+                );
+                if let Err(e) = tube.send(&response) {
+                    error!("gpu shmem handler: send failed: {}", e);
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 /// IRQ handler thread — polls device IRQ eventfds and routes interrupts.

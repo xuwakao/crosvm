@@ -281,6 +281,11 @@ impl Vm for HvfVm {
         let skip_mapping = cache == MemCacheType::CacheNonCoherent;
 
         if !skip_mapping {
+            // Apple Silicon uses 16KB pages. hv_vm_map requires size to be
+            // page-aligned. Round up if the region isn't aligned.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let aligned_size = (size + page_size - 1) & !(page_size - 1);
+
             let mut flags = ffi::HV_MEMORY_READ;
             if !read_only {
                 flags |= ffi::HV_MEMORY_WRITE;
@@ -288,12 +293,14 @@ impl Vm for HvfVm {
             flags |= ffi::HV_MEMORY_EXEC;
 
             base::info!(
-                "HvfVm::add_memory_region: guest={:#x} size={:#x} host={:p} flags={:#x}",
-                guest_addr.0, size, host_addr, flags
+                "HvfVm::add_memory_region: guest={:#x} size={:#x} aligned={:#x} host={:p} flags={:#x}",
+                guest_addr.0, size, aligned_size, host_addr, flags
             );
 
-            // SAFETY: host_addr points to a valid mapped region of `size` bytes.
-            let ret = unsafe { ffi::hv_vm_map(host_addr, guest_addr.0, size, flags) };
+            // SAFETY: host_addr points to a valid mmap'd region. aligned_size rounds
+            // up to the host page boundary (16KB on Apple Silicon). The extra bytes
+            // beyond `size` are within the same mmap allocation (mmap rounds up).
+            let ret = unsafe { ffi::hv_vm_map(host_addr, guest_addr.0, aligned_size, flags) };
             if ret != ffi::HV_SUCCESS {
                 base::error!("hv_vm_map failed: ret={}", ret);
             }
@@ -356,7 +363,9 @@ impl Vm for HvfVm {
         // mapped on-demand by add_fd_mapping; the sub-region cleanup above
         // already handled those.
         if self.mapped_slots.lock().remove(&slot) {
-            let ret = unsafe { ffi::hv_vm_unmap(guest_addr.0, mem_region.size()) };
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+            let aligned_size = (mem_region.size() + page_size - 1) & !(page_size - 1);
+            let ret = unsafe { ffi::hv_vm_unmap(guest_addr.0, aligned_size) };
             hvf_result(ret)?;
         }
 
@@ -420,22 +429,19 @@ impl Vm for HvfVm {
         fd_offset: u64,
         prot: Protection,
     ) -> Result<()> {
-        // MAP_SHARED file mapping → hv_vm_map: true zero-copy DAX.
+        // MAP_SHARED file mapping → hv_vm_map for zero-copy DAX.
         //
-        // Guest load/store instructions directly access the host file's page
-        // cache. Writes propagate to the file immediately (MAP_SHARED semantics).
-        //
-        // HVF requirements (undocumented, empirically determined):
-        // 1. The fd must be opened with O_RDWR (not O_RDONLY), even for
-        //    read-only guest mappings. Handled in passthrough.rs set_up_mapping.
-        // 2. The mmap must use PROT_READ|PROT_WRITE for the same reason.
-        // 3. The DAX window must NOT be pre-mapped (hv_vm_map rejects mapping
-        //    over existing mappings). prepare_shared_memory_region uses
-        //    CacheNonCoherent to skip pre-mapping on HVF.
+        // Apple Silicon uses 16KB pages. hv_vm_map requires guest_addr and size
+        // to be 16KB-aligned. GPU blob sizes are padded to 16KB in
+        // resource_create_blob (macOS), so each blob maps to complete 16KB pages
+        // without overlapping adjacent blobs.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let map_size = (size + page_size - 1) & !(page_size - 1);
+
         let host_addr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                size,
+                map_size,
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED,
                 fd.as_raw_descriptor(),
@@ -446,57 +452,42 @@ impl Vm for HvfVm {
             return Err(base::Error::new(unsafe { *libc::__error() }));
         }
 
-        // Find the guest physical address for this slot+offset.
         let mem_regions = self.mem_regions.lock();
         let (guest_base, mem_region) = mem_regions
             .get(&slot)
             .ok_or(base::Error::new(libc::EINVAL))?;
-        // Bounds check: mapping must fit within the registered DAX window.
         if offset.checked_add(size).map_or(true, |end| end > mem_region.size()) {
             drop(mem_regions);
-            unsafe { libc::munmap(host_addr, size) };
+            unsafe { libc::munmap(host_addr, map_size) };
             return Err(base::Error::new(libc::EINVAL));
         }
         let guest_addr = guest_base.0 + offset as u64;
         drop(mem_regions);
 
-        // Map into guest address space.
         let mut hvf_flags = ffi::HV_MEMORY_READ;
         if prot.allows(&Protection::write()) {
             hvf_flags |= ffi::HV_MEMORY_WRITE;
         }
 
-        // Unmap any previous DAX mapping at this guest address (e.g., when
-        // remapping a different file into the same DAX window slot).
-        // First-use unmaps return HV_BAD_PARAMETER (no prior mapping), which
-        // is expected and harmless.
-        unsafe { ffi::hv_vm_unmap(guest_addr, size) };
-
-        let ret = unsafe { ffi::hv_vm_map(host_addr as *const _, guest_addr, size, hvf_flags) };
-        if ret != ffi::HV_SUCCESS {
-            base::error!(
-                "DAX hv_vm_map FAILED: ret={:#x} host={:?} guest={:#x} size={:#x} flags={:#x}",
-                ret, host_addr, guest_addr, size, hvf_flags
-            );
-            unsafe { libc::munmap(host_addr, size) };
-            let errno = match ret {
-                ffi::HV_BAD_ARGUMENT => libc::EINVAL,
-                ffi::HV_NO_RESOURCES => libc::ENOMEM,
-                ffi::HV_DENIED => libc::EACCES,
-                _ => libc::EIO,  // HV_ERROR, HV_BUSY, etc.
-            };
-            return Err(base::Error::new(errno));
-        }
-
-        // Track the mapping for cleanup. If remapping the same (slot, offset),
-        // munmap the previous host mapping to prevent memory leaks.
+        // Unmap previous mapping at this exact key only (no blind unmap).
         let key = (slot, offset);
-        if let Some(old) = self.dax_mappings.lock().insert(
-            key,
-            DaxMapping { host_addr, guest_addr, size },
-        ) {
+        if let Some(old) = self.dax_mappings.lock().remove(&key) {
+            unsafe { ffi::hv_vm_unmap(old.guest_addr, old.size) };
             unsafe { libc::munmap(old.host_addr, old.size) };
         }
+
+        let ret = unsafe { ffi::hv_vm_map(host_addr as *const _, guest_addr, map_size, hvf_flags) };
+        if ret != ffi::HV_SUCCESS {
+            base::error!("hv_vm_map failed in add_fd_mapping: ret={:#x} guest={:#x} size={:#x}",
+                         ret, guest_addr, map_size);
+            unsafe { libc::munmap(host_addr, map_size) };
+            return Err(base::Error::new(libc::EINVAL));
+        }
+
+        self.dax_mappings.lock().insert(
+            key,
+            DaxMapping { host_addr, guest_addr, size: map_size },
+        );
 
         Ok(())
     }
