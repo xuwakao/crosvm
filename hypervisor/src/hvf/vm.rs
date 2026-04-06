@@ -39,6 +39,9 @@ struct DaxMapping {
     host_addr: *mut libc::c_void,
     guest_addr: u64,
     size: usize,
+    /// If true, host_addr was obtained via mmap and must be munmap'd on cleanup.
+    /// False for Venus zero-copy pointers (owned by MoltenVK vkMapMemory).
+    mmap_owned: bool,
 }
 // SAFETY: DaxMapping contains a raw pointer to mmap'd memory that is only
 // accessed within the VM's memory management methods (add_fd_mapping/remove_mapping).
@@ -344,9 +347,9 @@ impl Vm for HvfVm {
                 .collect();
             for key in keys {
                 if let Some(mapping) = dax_map.remove(&key) {
-                    unsafe {
-                        ffi::hv_vm_unmap(mapping.guest_addr, mapping.size);
-                        libc::munmap(mapping.host_addr, mapping.size);
+                    unsafe { ffi::hv_vm_unmap(mapping.guest_addr, mapping.size) };
+                    if mapping.mmap_owned {
+                        unsafe { libc::munmap(mapping.host_addr, mapping.size) };
                     }
                 }
             }
@@ -505,7 +508,7 @@ impl Vm for HvfVm {
         let key = (slot, offset);
         if let Some(old) = self.dax_mappings.lock().remove(&key) {
             unsafe { ffi::hv_vm_unmap(old.guest_addr, old.size) };
-            if old.size > 0 { unsafe { libc::munmap(old.host_addr, old.size) }; }
+            if old.mmap_owned { unsafe { libc::munmap(old.host_addr, old.size) }; }
         }
 
         let ret = unsafe { ffi::hv_vm_map(host_addr as *const _, guest_addr, map_size, hvf_flags) };
@@ -518,7 +521,7 @@ impl Vm for HvfVm {
 
         self.dax_mappings.lock().insert(
             key,
-            DaxMapping { host_addr, guest_addr, size: if mmap_owned { map_size } else { 0 } },
+            DaxMapping { host_addr, guest_addr, size: map_size, mmap_owned },
         );
 
         Ok(())
@@ -538,9 +541,11 @@ impl Vm for HvfVm {
             if ret != ffi::HV_SUCCESS {
                 base::warn!("hv_vm_unmap failed: ret={:#x} guest={:#x}", ret, mapping.guest_addr);
             }
-            // Unmap from host.
-            if unsafe { libc::munmap(mapping.host_addr, mapping.size) } != 0 {
-                base::warn!("munmap failed for DAX host mapping at {:?}", mapping.host_addr);
+            // Unmap from host (skip for Venus zero-copy pointers).
+            if mapping.mmap_owned {
+                if unsafe { libc::munmap(mapping.host_addr, mapping.size) } != 0 {
+                    base::warn!("munmap failed for DAX host mapping at {:?}", mapping.host_addr);
+                }
             }
         }
         Ok(())
