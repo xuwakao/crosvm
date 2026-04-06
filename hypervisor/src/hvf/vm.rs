@@ -438,19 +438,51 @@ impl Vm for HvfVm {
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
         let map_size = (size + page_size - 1) & !(page_size - 1);
 
-        let host_addr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                map_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd.as_raw_descriptor(),
-                fd_offset as libc::off_t,
-            )
-        };
-        if host_addr == libc::MAP_FAILED {
-            return Err(base::Error::new(unsafe { *libc::__error() }));
+        // Check for Venus zero-copy marker: if the fd starts with "VENUSPTR"
+        // magic + a host pointer, use the pointer directly for hv_vm_map
+        // instead of mmap'ing the fd. This gives zero-copy access to
+        // MoltenVK Metal shared storage (CPU/GPU coherent on Apple Silicon).
+        let mut venus_host_ptr: *mut libc::c_void = std::ptr::null_mut();
+        {
+            let mut header = [0u64; 2];
+            // Header is at the END of the file: offset = size (the blob data size)
+            let n = unsafe {
+                libc::pread(
+                    fd.as_raw_descriptor(),
+                    header.as_mut_ptr() as *mut libc::c_void,
+                    16,
+                    size as libc::off_t,
+                )
+            };
+            if n == 16 && header[0] == 0x56454E5553505452u64 {
+                let ptr = header[1] as *mut libc::c_void;
+                // Only use zero-copy if the pointer is 16KB-aligned (Apple Silicon page size)
+                if (ptr as usize & (page_size - 1)) == 0 {
+                    venus_host_ptr = ptr;
+                }
+            }
         }
+
+        let (host_addr, mmap_owned) = if !venus_host_ptr.is_null() {
+            // Zero-copy: use vkMapMemory host_ptr directly
+            (venus_host_ptr, false)
+        } else {
+            // Standard path: mmap the fd
+            let addr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    map_size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd.as_raw_descriptor(),
+                    fd_offset as libc::off_t,
+                )
+            };
+            if addr == libc::MAP_FAILED {
+                return Err(base::Error::new(unsafe { *libc::__error() }));
+            }
+            (addr, true)
+        };
 
         let mem_regions = self.mem_regions.lock();
         let (guest_base, mem_region) = mem_regions
@@ -458,7 +490,7 @@ impl Vm for HvfVm {
             .ok_or(base::Error::new(libc::EINVAL))?;
         if offset.checked_add(size).map_or(true, |end| end > mem_region.size()) {
             drop(mem_regions);
-            unsafe { libc::munmap(host_addr, map_size) };
+            if mmap_owned { unsafe { libc::munmap(host_addr, map_size) }; }
             return Err(base::Error::new(libc::EINVAL));
         }
         let guest_addr = guest_base.0 + offset as u64;
@@ -473,20 +505,20 @@ impl Vm for HvfVm {
         let key = (slot, offset);
         if let Some(old) = self.dax_mappings.lock().remove(&key) {
             unsafe { ffi::hv_vm_unmap(old.guest_addr, old.size) };
-            unsafe { libc::munmap(old.host_addr, old.size) };
+            if old.size > 0 { unsafe { libc::munmap(old.host_addr, old.size) }; }
         }
 
         let ret = unsafe { ffi::hv_vm_map(host_addr as *const _, guest_addr, map_size, hvf_flags) };
         if ret != ffi::HV_SUCCESS {
             base::error!("hv_vm_map failed in add_fd_mapping: ret={:#x} guest={:#x} size={:#x}",
                          ret, guest_addr, map_size);
-            unsafe { libc::munmap(host_addr, map_size) };
+            if mmap_owned { unsafe { libc::munmap(host_addr, map_size) }; }
             return Err(base::Error::new(libc::EINVAL));
         }
 
         self.dax_mappings.lock().insert(
             key,
-            DaxMapping { host_addr, guest_addr, size: map_size },
+            DaxMapping { host_addr, guest_addr, size: if mmap_owned { map_size } else { 0 } },
         );
 
         Ok(())
