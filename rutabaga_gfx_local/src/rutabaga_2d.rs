@@ -325,37 +325,33 @@ impl RutabagaComponent for Rutabaga2D {
             .as_mut()
             .ok_or(RutabagaError::Invalid2DInfo)?;
 
-        let (width, height, src_slices, src_stride) = if info_2d.host_mem.is_none() {
-            // Blob (guest only) provides stride in the scanout command.
-            let Some(scanout_stride) = info_2d.scanout_stride else {
-                return Err(RutabagaError::InvalidResourceId);
+        // Read from guest backing_iovecs directly (most up-to-date on HVF).
+        let (width, height, src_slices, src_stride) = if let Some(iovecs) = resource.backing_iovecs.as_ref() {
+            let resource_bpp: u32 = 4;
+            let stride = if let Some(s) = info_2d.scanout_stride {
+                s
+            } else {
+                resource_bpp * info_2d.width
             };
-
-            let iovecs = resource
-                .backing_iovecs
-                .as_ref()
-                .ok_or(RutabagaError::InvalidIovec)?;
 
             let mut src_slices = Vec::with_capacity(iovecs.len());
             for iovec in iovecs {
-                // SAFETY:
-                // Safe because Rutabaga users should have already checked the iovecs.
                 let slice = unsafe { std::slice::from_raw_parts(iovec.base as *mut u8, iovec.len) };
                 src_slices.push(slice);
             }
 
-            (transfer.w, transfer.h, src_slices, scanout_stride)
-        } else {
-            // All official virtio_gpu formats are 4 bytes per pixel.
-            let resource_bpp = 4;
+            (info_2d.width, info_2d.height, src_slices, stride)
+        } else if info_2d.host_mem.is_some() {
+            let resource_bpp: u32 = 4;
             let src_stride = resource_bpp * info_2d.width;
-
             (
                 info_2d.width,
                 info_2d.height,
-                vec![info_2d.host_mem.as_mut().unwrap().as_slice()],
+                vec![info_2d.host_mem.as_ref().unwrap().as_slice()],
                 src_stride,
             )
+        } else {
+            return Err(RutabagaError::InvalidIovec);
         };
 
         transfer_2d(
