@@ -325,8 +325,18 @@ impl RutabagaComponent for Rutabaga2D {
             .as_mut()
             .ok_or(RutabagaError::Invalid2DInfo)?;
 
-        // Read from guest backing_iovecs directly (most up-to-date on HVF).
-        let (width, height, src_slices, src_stride) = if let Some(iovecs) = resource.backing_iovecs.as_ref() {
+        // Prefer host_mem (populated by transfer_write from guest backing pages).
+        // Fall back to backing_iovecs for blob resources without host_mem.
+        let (width, height, src_slices, src_stride) = if info_2d.host_mem.is_some() {
+            let resource_bpp: u32 = 4;
+            let src_stride = resource_bpp * info_2d.width;
+            (
+                info_2d.width,
+                info_2d.height,
+                vec![info_2d.host_mem.as_ref().unwrap().as_slice()],
+                src_stride,
+            )
+        } else if let Some(iovecs) = resource.backing_iovecs.as_ref() {
             let resource_bpp: u32 = 4;
             let stride = if let Some(s) = info_2d.scanout_stride {
                 s
@@ -341,15 +351,6 @@ impl RutabagaComponent for Rutabaga2D {
             }
 
             (info_2d.width, info_2d.height, src_slices, stride)
-        } else if info_2d.host_mem.is_some() {
-            let resource_bpp: u32 = 4;
-            let src_stride = resource_bpp * info_2d.width;
-            (
-                info_2d.width,
-                info_2d.height,
-                vec![info_2d.host_mem.as_ref().unwrap().as_slice()],
-                src_stride,
-            )
         } else {
             return Err(RutabagaError::InvalidIovec);
         };
