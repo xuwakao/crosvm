@@ -448,20 +448,27 @@ impl Vm for HvfVm {
         let mut venus_host_ptr: *mut libc::c_void = std::ptr::null_mut();
         {
             let mut header = [0u64; 2];
-            // Header is at the END of the file: offset = size (the blob data size)
+            // VENUSPTR trailer is at the END of the actual file, which may be
+            // smaller than `size` (blob_size is padded to 16KB on macOS).
+            // The trailer is 16 bytes: [8-byte magic "VENUSPTR"][8-byte host_ptr].
+            let file_size = unsafe {
+                libc::lseek(fd.as_raw_descriptor(), 0, libc::SEEK_END)
+            };
+            let trailer_offset = if file_size > 16 { file_size - 16 } else { size as i64 };
             let n = unsafe {
                 libc::pread(
                     fd.as_raw_descriptor(),
                     header.as_mut_ptr() as *mut libc::c_void,
                     16,
-                    size as libc::off_t,
+                    trailer_offset as libc::off_t,
                 )
             };
             if n == 16 && header[0] == 0x56454E5553505452u64 {
                 let ptr = header[1] as *mut libc::c_void;
-                // Only use zero-copy if the pointer is 16KB-aligned (Apple Silicon page size)
                 if (ptr as usize & (page_size - 1)) == 0 {
                     venus_host_ptr = ptr;
+                } else {
+                    base::warn!("VENUSPTR: unaligned ptr={:p}, falling back to mmap", ptr);
                 }
             }
         }
