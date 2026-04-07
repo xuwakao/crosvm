@@ -411,6 +411,9 @@ impl Frontend {
             )),
             GpuCommand::ResourceCreate2d(info) => {
                 let resource_id = info.resource_id.to_native();
+                info!("[gpu2d] ResourceCreate2d res={} {}x{} fmt={}",
+                      resource_id, info.width.to_native(), info.height.to_native(),
+                      info.format.to_native());
 
                 let resource_create_3d = ResourceCreate3D {
                     target: RUTABAGA_PIPE_TEXTURE_2D,
@@ -431,12 +434,17 @@ impl Frontend {
             GpuCommand::ResourceUnref(info) => {
                 self.virtio_gpu.unref_resource(info.resource_id.to_native())
             }
-            GpuCommand::SetScanout(info) => self.virtio_gpu.set_scanout(
+            GpuCommand::SetScanout(info) => {
+                info!("[gpu2d] SetScanout scanout={} res={} rect={}x{}+{}+{}",
+                      info.scanout_id.to_native(), info.resource_id.to_native(),
+                      info.r.width.to_native(), info.r.height.to_native(),
+                      info.r.x.to_native(), info.r.y.to_native());
+                self.virtio_gpu.set_scanout(
                 info.r,
                 info.scanout_id.to_native(),
                 info.resource_id.to_native(),
                 None,
-            ),
+            )}
             GpuCommand::ResourceFlush(info) => {
                 self.virtio_gpu.flush_resource(info.resource_id.to_native())
             }
@@ -452,6 +460,8 @@ impl Frontend {
                 self.virtio_gpu.transfer_write(0, resource_id, transfer)
             }
             GpuCommand::ResourceAttachBacking(info) => {
+                info!("[gpu2d] AttachBacking res={} entries={}",
+                      info.resource_id.to_native(), info.nr_entries.to_native());
                 let available_bytes = reader.available_bytes();
                 if available_bytes != 0 {
                     let entry_count = info.nr_entries.to_native() as usize;

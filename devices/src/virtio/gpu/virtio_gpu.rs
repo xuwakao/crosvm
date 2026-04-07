@@ -426,10 +426,8 @@ impl VirtioGpuScanout {
         // Import failed, fall back to a copy.
         let mut display = display.borrow_mut();
 
-        // Prevent overwriting a buffer that is currently being used by the compositor.
-        if display.next_buffer_in_use(surface_id) {
-            return Ok(OkNoData);
-        }
+        // Note: skipping next_buffer_in_use check — our SHM display doesn't
+        // have a compositor that holds buffer references.
 
         let fb = display
             .framebuffer_region(surface_id, 0, 0, self.width, self.height)
@@ -803,7 +801,15 @@ impl VirtioGpu {
             scanout_id,
             scanout_data,
             resource_id,
-        )
+        )?;
+
+        // On macOS/HVF, DRM atomic page flip (SetScanout) does not send a
+        // separate TransferToHost2d + ResourceFlush. Flush here so that the
+        // new framebuffer content is copied to the display.
+        if resource_id != 0 {
+            self.flush_resource(resource_id)?;
+        }
+        Ok(OkNoData)
     }
 
     /// If the resource is the scanout resource, flush it to the display.
